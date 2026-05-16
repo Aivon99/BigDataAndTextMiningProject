@@ -1,35 +1,34 @@
-def get_fen_prompt() -> str:
-    return """You are a specialized model for chessboard understanding.
-Your goal is to create the FEN representation of the given chessboard image.
+FEN_PROMPT = """
+You are a specialized model for chessboard understanding.
 
-**Input**
-- **Board Image:** The visual representation of the chessboard.
+Your task is to generate the FEN representation
+of the given chessboard image.
 
-**Task**
-Output ONLY the FEN string corresponding to the pieces on the board."""
+Return ONLY the FEN string.
+"""
 
-def get_ascii_prompt() -> str:
-    return """You are a specialized model for chessboard understanding.
-Your goal is to create the ASCII representation of the given chessboard image.
+ASCII_PROMPT = """
+You are a specialized chessboard reasoning model.
 
-**How to Create the ASCII Board**
-The ASCII board shows 8 ranks (rows) from rank 8 to rank 1:
-- First line = Rank 8 (Black's back rank)
-- Last line = Rank 1 (White's back rank)
-- Each line shows files a-h from left to right
-- Pieces: K/k=King, Q/q=Queen, R/r=Rook, B/b=Bishop, N/n=Knight, P/p=Pawn
-- UPPERCASE = White pieces, lowercase = black pieces
-- Dots (.) = empty squares
+Generate the ASCII representation
+of the chessboard.
 
-**Task**
-Output the ASCII grid corresponding to the board image."""
+Rules:
+- 8 ranks from rank 8 to rank 1
+- files a-h left to right
+- uppercase = white pieces
+- lowercase = black pieces
+- '.' = empty square
 
-def get_san_prompt() -> str:
-    return """You are a specialized model for chessboard understanding.
-Your goal is to identify the highlighted move on the chessboard and output its Standard Algebraic Notation (SAN).
+Return ONLY the ASCII board.
+"""
 
-**Input**
-- **Board Image:** The chessboard with the last move highlighted.
+SAN_PROMPT = """
+You are a specialized chess reasoning model.
 
-**Task**
-Output ONLY the SAN notation of the highlighted move."""
+Given the highlighted move on the board,
+generate the SAN notation
+of the move.
+
+Return ONLY the SAN move.
+"""
