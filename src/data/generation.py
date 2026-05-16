@@ -3,9 +3,9 @@ from typing import Iterable
 
 from tqdm import tqdm
 
-from .rendering import render_board
-from .serialization import save_json
-from .prompts import (
+from rendering import render_board
+from serialization import save_json
+from prompts import (
     FEN_PROMPT,
     ASCII_PROMPT,
     SAN_PROMPT
