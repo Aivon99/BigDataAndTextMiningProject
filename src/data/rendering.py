@@ -11,9 +11,11 @@ def fen_to_board(fen: str) -> chess.Board:
     """
     Convert FEN string into python-chess Board.
     """
-
-    return chess.Board(fen)
-
+    try: 
+        return chess.Board(fen)
+    except ValueError as e:
+        raise ValueError(f"Invalid FEN string: {fen}") from e
+        
 
 def create_svg_board(
     board: chess.Board,

@@ -94,18 +94,21 @@ def generate_dataset(
     for idx, fen in enumerate(tqdm(fens)):
 
         sample_id = f"sample_{idx:06d}"
+        try:
+            build_sample(
+                fen=fen,
+                sample_id=sample_id,
+                output_dir=output_dir,
+                image_size=image_size,
+                task=task
+            )
+        except Exception as e:
+            print(f"Error processing FEN {fen}: {e}")
+            continue
 
-        build_sample(
-            fen=fen,
-            sample_id=sample_id,
-            output_dir=output_dir,
-            image_size=image_size,
-            task=task
-        )
 
 
 class ChessDatasetGenerator:
-
     def __init__(
         self,
         fens,
@@ -122,14 +125,17 @@ class ChessDatasetGenerator:
         for idx, fen in enumerate(self.fens):
 
             sample_id = f"sample_{idx:06d}"
+            try:
 
-            yield build_sample(
-                fen=fen,
-                sample_id=sample_id,
-                image_size=self.image_size,
-                task=self.task
-            )
-
+                yield build_sample(
+                    fen=fen,
+                    sample_id=sample_id,
+                    image_size=self.image_size,
+                    task=self.task
+                )
+            except Exception as e:
+                print(f"Error processing FEN {fen}: {e}")
+                continue
 
 
 
