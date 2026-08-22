@@ -1,7 +1,7 @@
 import io
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, Iterator, List, Optional, Union
 
 import cairosvg
 import chess
@@ -12,7 +12,6 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 
-# Standardized prompts according to project specifications (Section 3.2)
 PROMPTS = {
     "task1": (
         "You are a specialized model for chessboard understanding.\n"
@@ -141,6 +140,68 @@ def build_sample(
             json.dump(metadata, f, indent=2)
 
     return {"images": images, "metadata": metadata}
+
+
+def iter_task_samples(
+    df: pd.DataFrame,
+    task: str,
+    image_size: int = 512,
+) -> Iterator[Dict[str, Union[Image.Image, str]]]:
+    """
+    Lazily yields one flattened sample per row for `task`, rendering images
+    on the fly and never writing to disk. Feed directly into
+    `datasets.Dataset.from_generator` so a full task/split dataset can be
+    built and pushed to the Hub without holding all images in memory at once.
+    """
+    if task not in PROMPTS:
+        raise ValueError(f"Unsupported task '{task}'. Expected one of: {list(PROMPTS.keys())}")
+
+    for idx, (_, row) in enumerate(df.iterrows()):
+        sample_id = f"sample_{idx:06d}"
+        fen = row["FEN"]
+        moves = row.get("Moves", None)
+        puzzle_id = str(row.get("PuzzleId", sample_id))
+
+        board = chess.Board(fen)
+        first_move_uci = moves.split()[0] if moves and isinstance(moves, str) else None
+        first_move = chess.Move.from_uci(first_move_uci) if first_move_uci else None
+
+        base = {
+            "sample_id": sample_id,
+            "puzzle_id": puzzle_id,
+            "fen": fen,
+            "prompt": PROMPTS[task],
+        }
+
+        if task == "task1":
+            yield {
+                **base,
+                "image": render_board_svg(board=board, size=image_size),
+                "target": fen,
+            }
+
+        elif task == "task2":
+            if first_move is None:
+                raise ValueError(f"Task 2 requires a valid move sequence, none found for FEN: {fen}")
+            yield {
+                **base,
+                "image": render_board_svg(board=board, size=image_size, lastmove=first_move),
+                "target": board.san(first_move),
+            }
+
+        elif task == "task3":
+            if first_move is None:
+                raise ValueError(f"Task 3 requires a valid move sequence, none found for FEN: {fen}")
+            target = board.san(first_move)
+            image_t = render_board_svg(board=board, size=image_size)
+            board.push(first_move)
+            image_t1 = render_board_svg(board=board, size=image_size)
+            yield {
+                **base,
+                "image_t": image_t,
+                "image_t1": image_t1,
+                "target": target,
+            }
 
 
 def generate_dataset(
