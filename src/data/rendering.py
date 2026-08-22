@@ -48,7 +48,6 @@ def svg_to_pil(svg_string: str) -> Image.Image:
 
     return image
 
-
 def render_board(
     fen: str,
     size: int = 512,
