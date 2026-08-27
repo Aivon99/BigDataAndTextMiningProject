@@ -89,13 +89,19 @@ def build_sample(
     # ---------------------------------------------------------
     # Task 2: Move Prediction (Single board image with last move highlighted)
     # ---------------------------------------------------------
-    elif task == "task2":
-        if first_move is None:
-            raise ValueError(f"Task 2 requires a valid move sequence, none found for FEN: {fen}")
-        target = board.san(first_move)
-        img = render_board_svg(board=board, size=image_size, lastmove=first_move)
-        images.append(img)
-        saved_filenames.append("board.png")
+   elif task == "task2":
+    if first_move is None:
+        raise ValueError(f"Task 2 requires a valid move sequence, none found for FEN: {fen}")
+    
+    # Calcola la notazione SAN prima di applicare la mossa
+    target = board.san(first_move)
+    
+    # Applica la mossa per mostrare la scacchiera aggiornata con lastmove evidenziata
+    board.push(first_move)
+    img = render_board_svg(board=board, size=image_size, lastmove=first_move)
+    
+    images.append(img)
+    saved_filenames.append("board.png")
 
     # ---------------------------------------------------------
     # Task 3: Dual-Image Delta Move (Consecutive frame pair [t, t+1])
