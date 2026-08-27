@@ -45,7 +45,7 @@ PROMPTS = {
 def render_board_svg(
     board: chess.Board,
     size: int = 512,
-    lastmove: Optional[chess.Move] = None
+    lastmove: Optional[chess.Move] = None,
 ) -> Image.Image:
     """
     Renders a chess.Board state to an RGB PIL Image via SVG rasterization.
@@ -89,17 +89,17 @@ def build_sample(
     # ---------------------------------------------------------
     # Task 2: Move Prediction (Single board image with last move highlighted)
     # ---------------------------------------------------------
-   elif task == "task2":
+    elif task == "task2":
         if first_move is None:
             raise ValueError(f"Task 2 requires a valid move sequence, none found for FEN: {fen}")
-    
-    # Calcola la notazione SAN prima di applicare la mossa
+
+        # Compute SAN notation before applying move
         target = board.san(first_move)
-    
-    # Applica la mossa per mostrare la scacchiera aggiornata con lastmove evidenziata
+
+        # Apply move to render updated board with highlighted last move
         board.push(first_move)
         img = render_board_svg(board=board, size=image_size, lastmove=first_move)
-    
+
         images.append(img)
         saved_filenames.append("board.png")
 
