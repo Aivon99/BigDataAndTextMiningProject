@@ -134,7 +134,7 @@ def generate_dataset(
     output_dir: Union[str, Path],
     image_size: int = 512,
 ) -> None:
-    """Generates a batch dataset for a specific task and creates metadata.jsonl for Hugging Face ImageFolder."""
+    """Generates a batch dataset for a specific task and creates a clean metadata.jsonl for Hugging Face ImageFolder."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -156,19 +156,23 @@ def generate_dataset(
         metadata = result["metadata"]
         saved_files = metadata["image_files"]
 
-        if len(saved_files) == 1:
-            file_field = f"{sample_id}/{saved_files[0]}"
-        else:
-            file_field = [f"{sample_id}/{fname}" for fname in saved_files]
-
+        # Base record with scalar fields only (safely handled by Hugging Face ImageFolder)
         record = {
-            "file_name": file_field,
             "target": metadata["target"],
-            "prompt": metadata["prompt"],
             "fen": metadata["fen"],
+            "prompt": metadata["prompt"],
             "sample_id": sample_id,
+            "puzzle_id": metadata["puzzle_id"],
             "task": task,
         }
+
+        # Assign file paths as scalar strings instead of lists
+        if len(saved_files) == 1:
+            record["file_name"] = f"{sample_id}/{saved_files[0]}"
+        elif len(saved_files) == 2:
+            record["file_name"] = f"{sample_id}/{saved_files[0]}"
+            record["file_name_t1"] = f"{sample_id}/{saved_files[1]}"
+
         dataset_records.append(record)
 
     metadata_file_path = output_path / "metadata.jsonl"
