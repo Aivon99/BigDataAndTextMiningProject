@@ -122,10 +122,7 @@ def build_sample(
         for img, fname in zip(images, saved_filenames):
             img.save(sample_dir / fname)
 
-        with open(sample_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-
-    return {"images": images, "metadata": metadata}
+    return {"images": images, "metadata": metadata}}
 
 
 def generate_dataset(
