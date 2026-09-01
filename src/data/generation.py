@@ -156,22 +156,17 @@ def generate_dataset(
         metadata = result["metadata"]
         saved_files = metadata["image_files"]
 
-        # Base record with scalar fields only (safely handled by Hugging Face ImageFolder)
+        # Base record with uniform schema across all tasks to prevent CastError
         record = {
-            "target": metadata["target"],
-            "fen": metadata["fen"],
-            "prompt": metadata["prompt"],
             "sample_id": sample_id,
             "puzzle_id": metadata["puzzle_id"],
             "task": task,
+            "fen": metadata["fen"],
+            "prompt": metadata["prompt"],
+            "target": metadata["target"],
+            "file_name": f"{sample_id}/{saved_files[0]}",
+            "file_name_t1": f"{sample_id}/{saved_files[1]}" if len(saved_files) > 1 else ""
         }
-
-        # Assign file paths as scalar strings instead of lists
-        if len(saved_files) == 1:
-            record["file_name"] = f"{sample_id}/{saved_files[0]}"
-        elif len(saved_files) == 2:
-            record["file_name"] = f"{sample_id}/{saved_files[0]}"
-            record["file_name_t1"] = f"{sample_id}/{saved_files[1]}"
 
         dataset_records.append(record)
 
