@@ -12,7 +12,6 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 
-# Standardized prompts according to project specifications (Section 3.2)
 PROMPTS = {
     "task1": (
         "You are a specialized model for chessboard understanding.\n"
@@ -47,9 +46,7 @@ def render_board_svg(
     size: int = 512,
     lastmove: Optional[chess.Move] = None,
 ) -> Image.Image:
-    """
-    Renders a chess.Board state to an RGB PIL Image via SVG rasterization.
-    """
+    """Renders a chess.Board state to an RGB PIL Image via SVG rasterization."""
     svg_data = chess.svg.board(board=board, size=size, lastmove=lastmove)
     png_bytes = cairosvg.svg2png(bytestring=svg_data.encode("utf-8"))
     return Image.open(io.BytesIO(png_bytes)).convert("RGB")
@@ -64,9 +61,7 @@ def build_sample(
     output_dir: Optional[Union[str, Path]] = None,
     image_size: int = 512,
 ) -> Dict[str, Union[List[Image.Image], dict]]:
-    """
-    Builds a single multimodal sample for Task 1, Task 2, or Task 3.
-    """
+    """Builds a single multimodal sample for Task 1, Task 2, or Task 3."""
     if task not in PROMPTS:
         raise ValueError(f"Unsupported task '{task}'. Expected one of: {list(PROMPTS.keys())}")
 
@@ -77,44 +72,29 @@ def build_sample(
     images: List[Image.Image] = []
     saved_filenames: List[str] = []
 
-    # ---------------------------------------------------------
-    # Task 1: Image-to-FEN (Single clean board image)
-    # ---------------------------------------------------------
     if task == "task1":
         img = render_board_svg(board=board, size=image_size)
         images.append(img)
         saved_filenames.append("board.png")
         target = fen
 
-    # ---------------------------------------------------------
-    # Task 2: Move Prediction (Single board image with last move highlighted)
-    # ---------------------------------------------------------
     elif task == "task2":
         if first_move is None:
             raise ValueError(f"Task 2 requires a valid move sequence, none found for FEN: {fen}")
 
-        # Compute SAN notation before applying move
         target = board.san(first_move)
-
-        # Apply move to render updated board with highlighted last move
         board.push(first_move)
         img = render_board_svg(board=board, size=image_size, lastmove=first_move)
 
         images.append(img)
         saved_filenames.append("board.png")
 
-    # ---------------------------------------------------------
-    # Task 3: Dual-Image Delta Move (Consecutive frame pair [t, t+1])
-    # ---------------------------------------------------------
     elif task == "task3":
         if first_move is None:
             raise ValueError(f"Task 3 requires a valid move sequence, none found for FEN: {fen}")
         target = board.san(first_move)
 
-        # Render Frame t
         img_t = render_board_svg(board=board, size=image_size)
-
-        # Apply move and render Frame t+1
         board.push(first_move)
         img_t1 = render_board_svg(board=board, size=image_size)
 
@@ -135,7 +115,6 @@ def build_sample(
         "patch_size": 16,
     }
 
-    # Save to disk if output directory is provided
     if output_dir is not None:
         sample_dir = Path(output_dir) / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
@@ -155,15 +134,16 @@ def generate_dataset(
     output_dir: Union[str, Path],
     image_size: int = 512,
 ) -> None:
-    """
-    Generates a batch dataset for a specific task using dataframe records.
-    """
+    """Generates a batch dataset for a specific task and creates metadata.jsonl for Hugging Face ImageFolder."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    dataset_records = []
+
     for idx, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc=f"Generating {task}")):
         sample_id = f"sample_{idx:06d}"
-        build_sample(
+        
+        result = build_sample(
             fen=row["FEN"],
             moves=row.get("Moves", None),
             task=task,
@@ -172,3 +152,26 @@ def generate_dataset(
             output_dir=output_path,
             image_size=image_size,
         )
+
+        metadata = result["metadata"]
+        saved_files = metadata["image_files"]
+
+        if len(saved_files) == 1:
+            file_field = f"{sample_id}/{saved_files[0]}"
+        else:
+            file_field = [f"{sample_id}/{fname}" for fname in saved_files]
+
+        record = {
+            "file_name": file_field,
+            "target": metadata["target"],
+            "prompt": metadata["prompt"],
+            "fen": metadata["fen"],
+            "sample_id": sample_id,
+            "task": task,
+        }
+        dataset_records.append(record)
+
+    metadata_file_path = output_path / "metadata.jsonl"
+    with open(metadata_file_path, "w", encoding="utf-8") as f:
+        for record in dataset_records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
