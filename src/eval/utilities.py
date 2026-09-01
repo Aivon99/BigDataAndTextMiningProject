@@ -51,7 +51,7 @@ def calculate_square_by_square_accuracy(predicted_fen: str, ground_truth_fen: st
             
     return correct_squares / total_squares
 
-def evaluate_chessboard_model(model, processor, dataset_split, model_name: str) -> pd.DataFrame:
+def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name: str) -> pd.DataFrame:
     """
     Evaluates a given VLM model (vanilla or fine-tuned) on the chessboard Task 1 dataset 
     and returns a DataFrame containing predictions, metrics, and aggregate results.
