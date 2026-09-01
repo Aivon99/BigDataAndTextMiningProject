@@ -122,7 +122,7 @@ def build_sample(
         for img, fname in zip(images, saved_filenames):
             img.save(sample_dir / fname)
 
-    return {"images": images, "metadata": metadata}}
+    return {"images": images, "metadata": metadata}
 
 
 def generate_dataset(
