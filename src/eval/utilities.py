@@ -61,6 +61,13 @@ def calculate_square_by_square_accuracy(predicted_fen: str, ground_truth_fen: st
             
     return correct_squares / total_squares
 
+def calculate_san_exact_match(predicted_move: str, ground_truth_move: str) -> int:
+    """
+    Computes Exact Match (EM) for chess moves in SAN notation.
+    Returns 1 if predictions match the ground truth exactly, 0 otherwise.
+    """
+    return 1 if predicted_move.strip() == ground_truth_move.strip() else 0
+
 def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name: str) -> pd.DataFrame:
     """
     Evaluates a given VLM model (vanilla or fine-tuned) on the chessboard Task 1 dataset 
@@ -149,6 +156,88 @@ def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name
             "character_error_rate": mean_cer,
             "square_by_square_accuracy": mean_square_acc,
             "levenshtein_distance": mean_levenshtein
+        }
+    ])
+
+    return results_df, model_summary_df
+
+def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name: str) -> pd.DataFrame:
+    """
+    Evaluates a given VLM model (vanilla or fine-tuned) on the chessboard Task 2 dataset 
+    (Move Prediction) and returns a DataFrame containing predictions, metrics, and aggregate results.
+    """
+    model.eval()
+    results_list = []
+
+    # Iterate over the test dataset
+    for test_sample in tqdm(dataset_split, desc=f"Evaluating {model_name} (Task 2)"):
+        # 1. Extract fields from the sample based on the Task 2 structure
+        task_prompt = test_sample["prompt"]
+        ground_truth_move = test_sample["target"]
+        sample_id = test_sample["sample_id"]
+        board_image = test_sample["image"]
+
+        # 2. Prepare the multimodal input format for the model chat
+        chat_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": board_image},
+                    {"type": "text", "text": task_prompt},
+                ]
+            }
+        ]
+
+        # 3. Apply the processor's chat template
+        formatted_text = processor.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
+
+        # 4. Tokenize inputs and move them to the model's device
+        model_inputs = processor(
+            text=[formatted_text],
+            images=board_image,
+            padding=True,
+            return_tensors="pt"
+        ).to(model.device)
+
+        # 5. Generate the prediction (max_new_tokens is smaller for SAN notation)
+        with torch.no_grad():
+            output_token_ids = model.generate(**model_inputs, max_new_tokens=16)
+
+        # 6. Trim prompt tokens from the generated output
+        trimmed_output_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, output_token_ids)
+        ]
+        predicted_move = processor.batch_decode(
+            trimmed_output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
+
+        # 7. Compute metrics for the current sample
+        exact_match = calculate_san_exact_match(predicted_move, ground_truth_move)
+
+        # 8. Append row data including predictions and metrics
+        results_list.append({
+            "sample_id": sample_id,
+            "ground_truth": ground_truth_move,
+            "predicted": predicted_move,
+            "exact_match": exact_match
+        })
+
+    # Convert results into a Pandas DataFrame
+    results_df = pd.DataFrame(results_list)
+    
+    # Save sample-level results to CSV
+    csv_filename = f"task2_{model_name.lower().replace(' ', '_')}_results.csv"
+    results_df.to_csv(csv_filename, index=False)
+    print(f"\nEvaluation completed for {model_name}! Results saved to {csv_filename}.")
+
+    # Compute global aggregate metrics across the dataset
+    mean_em = results_df["exact_match"].mean()
+
+    # Create the model summary row for the global comparison table
+    model_summary_df = pd.DataFrame([
+        {
+            "model_name": model_name,
+            "exact_match": mean_em
         }
     ])
 
