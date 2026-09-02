@@ -1,8 +1,13 @@
 import Levenshtein
 import chess
+import numpy as np
 import pandas as pd
+from pathlib import Path
+from PIL import Image
 import torch
 from tqdm import tqdm
+from transformers import AutoModelForImageTextToText, Trainer, TrainingArguments
+from peft import get_peft_model
 
 
 def calculate_fen_exact_match(predicted_fen: str, ground_truth_fen: str) -> float:
@@ -147,3 +152,286 @@ def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name
     ])
 
     return results_df, model_summary_df
+
+def preprocess_function(sample, repo_root=None):
+    """
+    Unified preprocessing function for Vision-Language Models (Qwen-VL).
+    Dynamically handles Task 1, Task 2, and Task 3 based on the 'task' field in the sample.
+    """
+    task = sample.get("task", "task1")
+    prompt_text = sample["prompt"]
+    target_text = sample["target"]
+
+    # Configure multi-modal content based on the active task
+    if task in ["task1", "task2"]:
+        # Single-image tasks (Task 1: FEN extraction, Task 2: Highlighted move prediction)
+        board_image = sample["image"]
+
+        chat_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": board_image},
+                    {"type": "text", "text": prompt_text},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": target_text},
+                ],
+            }
+        ]
+        images_input = [board_image]
+
+    elif task == "task3":
+        # Dual-image task (Task 3: Temporal reasoning between State t and State t+1)
+        img_t = sample.get("image") or sample.get("image_t")
+
+        # Handle second frame: if stored as a string path in metadata, load it with PIL
+        t1_path = sample.get("file_name_t1")
+        if isinstance(t1_path, str) and t1_path.strip() != "":
+            if repo_root is not None:
+                img_t1_path = Path(repo_root) / t1_path
+            else:
+                img_t1_path = Path(t1_path)
+            img_t1 = Image.open(img_t1_path).convert("RGB")
+        else:
+            img_t1 = sample.get("image_t1") or t1_path
+
+        chat_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": img_t},
+                    {"type": "image", "image": img_t1},
+                    {"type": "text", "text": prompt_text},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": target_text},
+                ],
+            }
+        ]
+        images_input = [img_t, img_t1]
+
+    else:
+        raise ValueError(f"Unsupported task type found in sample: '{task}'")
+
+    # Apply the processor's chat template
+    text = processor.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=False)
+
+    # Tokenize text and process images together
+    batch = processor(
+        text=[text],
+        images=images_input,
+        padding="max_length",
+        max_length=512,
+        truncation=True,
+        return_tensors="pt"
+    )
+
+    # Clean up dimensions and set up labels for causal language modeling training
+    batch = {k: v[0] for k, v in batch.items()}
+    batch["labels"] = batch["input_ids"].clone()
+    batch["labels"][batch["labels"] == processor.tokenizer.pad_token_id] = -100
+
+    return batch
+
+def get_patch_reordering_indices(strategy="raster", grid_size=8):
+    """
+    Generates patch reordering index maps for an 8x8 chessboard grid.
+    Strategies supported: 'raster', 'zigzag', 'spiral', 'file_wise', 'rank_wise'
+    """
+    total_patches = grid_size * grid_size
+    indices = np.arange(total_patches).reshape(grid_size, grid_size)
+
+    if strategy == "raster":
+        return [int(x) for x in indices.flatten()]
+
+    elif strategy == "zigzag":
+        reordered = []
+        for r in range(grid_size):
+            row = indices[r, :]
+            if r % 2 == 1:
+                row = row[::-1]
+            reordered.extend(row)
+        return [int(x) for x in reordered]
+
+    elif strategy == "spiral":
+        reordered = []
+        top, bottom, left, right = 0, grid_size - 1, 0, grid_size - 1
+        while top <= bottom and left <= right:
+            for c in range(left, right + 1):
+                reordered.append(indices[top, c])
+            top += 1
+            for r in range(top, bottom + 1):
+                reordered.append(indices[r, right])
+            right -= 1
+            if top <= bottom:
+                for c in range(right, left - 1, -1):
+                    reordered.append(indices[bottom, c])
+                bottom -= 1
+            if left <= right:
+                for r in range(bottom, top - 1, -1):
+                    reordered.append(indices[r, left])
+                left += 1
+        return [int(x) for x in reordered]
+
+    elif strategy == "file_wise": # Column-wise
+        return [int(x) for x in indices.T.flatten()]
+
+    elif strategy == "rank_wise": # Row-wise (same as raster)
+        return [int(x) for x in indices.flatten()]
+
+    else:
+        raise ValueError(f"Unknown reordering strategy: {strategy}")
+
+def reorder_chessboard_image(image, strategy="raster", grid_size=8):
+    """
+    Slices a chessboard PIL Image into an 8x8 grid of tiles and
+    rearranges them according to the specified reordering strategy.
+    """
+    # Ensure image is square and resize to a multiple of grid_size (e.g., 512x512)
+    img_size = 512
+    image = image.resize((img_size, img_size))
+    tile_size = img_size // grid_size
+
+    # 1. Split image into 64 individual square tiles
+    tiles = []
+    for r in range(grid_size):
+        for c in range(grid_size):
+            box = (c * tile_size, r * tile_size, (c + 1) * tile_size, (r + 1) * tile_size)
+            tile = image.crop(box)
+            tiles.append(tile)
+
+    # 2. Get reordering indices for the chosen strategy
+    reorder_indices = get_patch_reordering_indices(strategy=strategy, grid_size=grid_size)
+
+    # 3. Rearrange tiles based on the indices
+    reordered_tiles = [tiles[i] for i in reorder_indices]
+
+    # 4. Stitch tiles back together into a new reordered image
+    new_image = Image.new("RGB", (img_size, img_size))
+    for idx, tile in enumerate(reordered_tiles):
+        r = idx // grid_size
+        c = idx % grid_size
+        new_image.paste(tile, (c * tile_size, r * tile_size))
+
+    return new_image
+
+def finetune_and_push_chessboard_model(
+    strategy_name,
+    dataset,
+    processor,
+    peft_config,
+    task,
+    base_model_id="Qwen/Qwen3.5-0.8B",
+    hf_org_prefix="bdatm-project",
+    repo_root=None
+):
+    print(f"\n==============================================")
+    print(f"Starting pipeline for TASK: {task.upper()} | STRATEGY: {strategy_name.upper()}")
+    print(f"==============================================")
+
+    # 1. Apply image-level reordering based on the task type
+    print(f"Applying {strategy_name} reordering to datasets for {task}...")
+
+    def reorder_split(split_ds):
+        def transform(sample):
+            if task in ["task1", "task2"]:
+                # Single-image tasks
+                img = sample["image"]
+                reordered_img = reorder_chessboard_image(img, strategy=strategy_name, grid_size=8)
+                return {"image": reordered_img}
+
+            elif task == "task3":
+                # Dual-image task (reorder both frame t and frame t+1)
+                img_t = sample["image"]
+                reordered_img_t = reorder_chessboard_image(img_t, strategy=strategy_name, grid_size=8)
+
+                # Handle second frame
+                t1_path = sample.get("file_name_t1")
+                if isinstance(t1_path, str) and t1_path.strip() != "":
+                    img_t1_path = Path(repo_root) / t1_path if repo_root else Path(t1_path)
+                    img_t1 = Image.open(img_t1_path).convert("RGB")
+                else:
+                    img_t1 = sample.get("image_t1") or t1_path
+
+                reordered_img_t1 = reorder_chessboard_image(img_t1, strategy=strategy_name, grid_size=8)
+
+                # Return both reordered frames
+                return {"image": reordered_img_t, "image_t1": reordered_img_t1}
+            else:
+                raise ValueError(f"Unknown task: {task}")
+
+        return split_ds.map(transform)
+
+    reordered_train = reorder_split(dataset["train"])
+    reordered_val = reorder_split(dataset["validation"])
+
+    # 2. Tokenize and preprocess the reordered datasets using the unified preprocessing function
+    print("Preprocessing datasets...")
+    tokenized_train = reordered_train.map(
+        lambda sample: preprocess_function(sample, repo_root=repo_root),
+        remove_columns=reordered_train.column_names
+    )
+    tokenized_val = reordered_val.map(
+        lambda sample: preprocess_function(sample, repo_root=repo_root),
+        remove_columns=reordered_val.column_names
+    )
+
+    # 3. Load a fresh base model instance and apply PEFT/LoRA
+    print("Loading base model and applying LoRA...")
+    model_instance = AutoModelForImageTextToText.from_pretrained(
+        base_model_id,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto"
+    )
+    lora_model_instance = get_peft_model(model_instance, peft_config)
+
+    # 4. Configure Training Arguments for this specific run
+    training_args_instance = TrainingArguments(
+        output_dir=f"./temp_{task}_{strategy_name}_output",
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=8,
+        learning_rate=2e-4,
+        logging_steps=10,
+        num_train_epochs=2,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        fp16=True,
+        remove_unused_columns=False,
+        report_to="none"
+    )
+
+    # 5. Initialize Trainer
+    trainer_instance = Trainer(
+        model=lora_model_instance,
+        args=training_args_instance,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+    )
+
+    # 6. Train the model
+    print(f"Training model for {task} with {strategy_name} reordering...")
+    trainer_instance.train()
+
+    # 7. Push final weights and processor directly to Hugging Face Hub
+    repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
+    print(f"Pushing model and processor to Hugging Face Hub: {repo_id_target}...")
+
+    trainer_instance.model.push_to_hub(
+        repo_id_target,
+        commit_message=f"Training complete for {task} using {strategy_name} reordering strategy"
+    )
+    processor.push_to_hub(
+        repo_id_target
+    )
+
+    print(f"Finished! Successfully uploaded to Hub: {repo_id_target}")
+
+    return trainer_instance.model
