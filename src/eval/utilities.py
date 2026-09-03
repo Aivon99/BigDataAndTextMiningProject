@@ -330,20 +330,13 @@ def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name
 
     return results_df, model_summary_df
 
-def preprocess_function(sample, processor, repo_root=None):
-    """
-    Unified preprocessing function for Vision-Language Models (Qwen-VL).
-    Dynamically handles Task 1, Task 2, and Task 3 based on the 'task' field in the sample.
-    """
+def preprocess_function(sample, processor):
     task = sample.get("task", "task1")
     prompt_text = sample["prompt"]
     target_text = sample["target"]
 
-    # Configure multi-modal content based on the active task
     if task in ["task1", "task2"]:
-        # Single-image tasks (Task 1: FEN extraction, Task 2: Highlighted move prediction)
         board_image = sample["image"]
-
         chat_messages = [
             {
                 "role": "user",
@@ -362,10 +355,9 @@ def preprocess_function(sample, processor, repo_root=None):
         images_input = [board_image]
 
     elif task == "task3":
-        # Dual-image task (Task 3: Temporal reasoning between State t and State t+1)
         img_t = sample.get("image") or sample.get("image_t")
         img_t1 = sample.get("image_t1")
-
+        
         chat_messages = [
             {
                 "role": "user",
@@ -385,26 +377,34 @@ def preprocess_function(sample, processor, repo_root=None):
         images_input = [img_t, img_t1]
 
     else:
-        raise ValueError(f"Unsupported task type found in sample: '{task}'")
+        raise ValueError(f"Unsupported task type: '{task}'")
 
-    # Apply the processor's chat template
-    text = processor.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=False)
+    # Genera la stringa tramite il template nativo di Qwen2.5-VL
+    text = processor.apply_chat_template(
+        chat_messages, 
+        tokenize=False, 
+        add_generation_prompt=False
+    )
 
-    # Tokenize text and process images together (WITHOUT truncation or fixed max_length to protect image tokens)
+    # Processa testo e immagini insieme
     batch = processor(
         text=[text],
         images=images_input,
+        padding=False,
         return_tensors="pt"
     )
 
-    # Clean up dimensions and set up labels for causal language modeling training
+    # Rimuovi la dimensione del batch iniziale
     batch = {k: v[0] for k, v in batch.items()}
+    
+    # Configura i labels per il Causal LM
     batch["labels"] = batch["input_ids"].clone()
-    # If you have a pad token ID, ensure labels for padding are set to -100
     if processor.tokenizer.pad_token_id is not None:
         batch["labels"][batch["labels"] == processor.tokenizer.pad_token_id] = -100
 
     return batch
+
+
 def get_patch_reordering_indices(strategy="raster", grid_size=8):
     """
     Generates patch reordering index maps for an 8x8 chessboard grid.
