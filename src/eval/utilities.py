@@ -364,17 +364,7 @@ def preprocess_function(sample, processor, repo_root=None):
     elif task == "task3":
         # Dual-image task (Task 3: Temporal reasoning between State t and State t+1)
         img_t = sample.get("image") or sample.get("image_t")
-
-        # Handle second frame: if stored as a string path in metadata, load it with PIL
-        t1_path = sample.get("file_name_t1")
-        if isinstance(t1_path, str) and t1_path.strip() != "":
-            if repo_root is not None:
-                img_t1_path = Path(repo_root) / t1_path
-            else:
-                img_t1_path = Path(t1_path)
-            img_t1 = Image.open(img_t1_path).convert("RGB")
-        else:
-            img_t1 = sample.get("image_t1") or t1_path
+        img_t1 = sampple.get("image_t1")
 
         chat_messages = [
             {
