@@ -364,7 +364,7 @@ def preprocess_function(sample, processor, repo_root=None):
     elif task == "task3":
         # Dual-image task (Task 3: Temporal reasoning between State t and State t+1)
         img_t = sample.get("image") or sample.get("image_t")
-        img_t1 = sampple.get("image_t1")
+        img_t1 = sample.get("image_t1")
 
         chat_messages = [
             {
