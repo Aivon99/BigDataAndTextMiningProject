@@ -390,23 +390,21 @@ def preprocess_function(sample, processor, repo_root=None):
     # Apply the processor's chat template
     text = processor.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=False)
 
-    # Tokenize text and process images together
+    # Tokenize text and process images together (WITHOUT truncation or fixed max_length to protect image tokens)
     batch = processor(
         text=[text],
         images=images_input,
-        padding="max_length",
-        max_length=512,
-        truncation=True,
         return_tensors="pt"
     )
 
     # Clean up dimensions and set up labels for causal language modeling training
     batch = {k: v[0] for k, v in batch.items()}
     batch["labels"] = batch["input_ids"].clone()
-    batch["labels"][batch["labels"] == processor.tokenizer.pad_token_id] = -100
+    # If you have a pad token ID, ensure labels for padding are set to -100
+    if processor.tokenizer.pad_token_id is not None:
+        batch["labels"][batch["labels"] == processor.tokenizer.pad_token_id] = -100
 
     return batch
-
 def get_patch_reordering_indices(strategy="raster", grid_size=8):
     """
     Generates patch reordering index maps for an 8x8 chessboard grid.
