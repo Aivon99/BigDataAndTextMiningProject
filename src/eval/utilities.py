@@ -243,6 +243,93 @@ def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name
 
     return results_df, model_summary_df
 
+
+def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name: str) -> pd.DataFrame:
+    """
+    Evaluates a given VLM model (vanilla or fine-tuned) on the chessboard Task 3 dataset 
+    (Dual-Image Delta Move) and returns a DataFrame containing predictions, metrics, and aggregate results.
+    """
+    model.eval()
+    results_list = []
+
+    # Iterate over the dataset split
+    for test_sample in tqdm(dataset_split, desc=f"Evaluating {model_name} on Task 3"):
+        # 1. Extract fields from the sample based on the dataset structure
+        task_prompt = test_sample["prompt"]
+        ground_truth_move = test_sample["target"]
+        sample_id = test_sample["sample_id"]
+        
+        # Frame 1 (State t) and Frame 2 (State t+1) images
+        frame_t_image = test_sample["image"]
+        frame_t_plus_1_image = test_sample["image_t1"]
+
+        # 2. Prepare the multimodal input format for the model chat with two images
+        chat_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": frame_t_image},
+                    {"type": "image", "image": frame_t_plus_1_image},
+                    {"type": "text", "text": task_prompt},
+                ]
+            }
+        ]
+
+        # 3. Apply the processor's chat template
+        formatted_text = processor.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
+
+        # 4. Tokenize inputs and pass both images as a list, then move them to the model's device
+        model_inputs = processor(
+            text=[formatted_text],
+            images=[frame_t_image, frame_t_plus_1_image],
+            padding=True,
+            return_tensors="pt"
+        ).to(model.device)
+
+        # 5. Generate the prediction
+        with torch.no_grad():
+            output_token_ids = model.generate(**model_inputs, max_new_tokens=128)
+
+        # 6. Trim prompt tokens from the generated output
+        trimmed_output_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, output_token_ids)
+        ]
+        predicted_move_string = processor.batch_decode(
+            trimmed_output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
+
+        # 7. Compute Exact Match (EM) metric using the predefined function
+        exact_match = calculate_san_exact_match(predicted_move_string, ground_truth_move)
+
+        # 8. Append row data including predictions and metrics
+        results_list.append({
+            "sample_id": sample_id,
+            "ground_truth": ground_truth_move,
+            "predicted": predicted_move_string,
+            "exact_match": exact_match
+        })
+
+    # Convert results into a Pandas DataFrame
+    results_df = pd.DataFrame(results_list)
+    
+    # Save sample-level results to CSV
+    csv_filename = f"task3_{model_name.lower().replace(' ', '_')}_results.csv"
+    results_df.to_csv(csv_filename, index=False)
+    print(f"\nEvaluation completed for {model_name} on Task 3! Results saved to {csv_filename}.")
+
+    # Compute global aggregate metrics across the dataset split
+    mean_em = results_df["exact_match"].mean()
+
+    # Create the model summary row for the global comparison table (omitting the task number)
+    model_summary_df = pd.DataFrame([
+        {
+            "model_name": model_name,
+            "exact_match": mean_em
+        }
+    ])
+
+    return results_df, model_summary_df
+
 def preprocess_function(sample, processor, repo_root=None):
     """
     Unified preprocessing function for Vision-Language Models (Qwen-VL).
