@@ -44,11 +44,9 @@ PROMPTS = {
 def render_board_svg(
     board: chess.Board,
     size: int = 512,
-    lastmove: Optional[chess.Move] = None
+    lastmove: Optional[chess.Move] = None,
 ) -> Image.Image:
-    """
-    Renders a chess.Board state to an RGB PIL Image via SVG rasterization.
-    """
+    """Renders a chess.Board state to an RGB PIL Image via SVG rasterization."""
     svg_data = chess.svg.board(board=board, size=size, lastmove=lastmove)
     png_bytes = cairosvg.svg2png(bytestring=svg_data.encode("utf-8"))
     return Image.open(io.BytesIO(png_bytes)).convert("RGB")
@@ -63,9 +61,7 @@ def build_sample(
     output_dir: Optional[Union[str, Path]] = None,
     image_size: int = 512,
 ) -> Dict[str, Union[List[Image.Image], dict]]:
-    """
-    Builds a single multimodal sample for Task 1, Task 2, or Task 3.
-    """
+    """Builds a single multimodal sample for Task 1, Task 2, or Task 3."""
     if task not in PROMPTS:
         raise ValueError(f"Unsupported task '{task}'. Expected one of: {list(PROMPTS.keys())}")
 
@@ -76,38 +72,29 @@ def build_sample(
     images: List[Image.Image] = []
     saved_filenames: List[str] = []
 
-    # ---------------------------------------------------------
-    # Task 1: Image-to-FEN (Single clean board image)
-    # ---------------------------------------------------------
     if task == "task1":
         img = render_board_svg(board=board, size=image_size)
         images.append(img)
         saved_filenames.append("board.png")
         target = fen
 
-    # ---------------------------------------------------------
-    # Task 2: Move Prediction (Single board image with last move highlighted)
-    # ---------------------------------------------------------
     elif task == "task2":
         if first_move is None:
             raise ValueError(f"Task 2 requires a valid move sequence, none found for FEN: {fen}")
+
         target = board.san(first_move)
+        board.push(first_move)
         img = render_board_svg(board=board, size=image_size, lastmove=first_move)
+
         images.append(img)
         saved_filenames.append("board.png")
 
-    # ---------------------------------------------------------
-    # Task 3: Dual-Image Delta Move (Consecutive frame pair [t, t+1])
-    # ---------------------------------------------------------
     elif task == "task3":
         if first_move is None:
             raise ValueError(f"Task 3 requires a valid move sequence, none found for FEN: {fen}")
         target = board.san(first_move)
 
-        # Render Frame t
         img_t = render_board_svg(board=board, size=image_size)
-
-        # Apply move and render Frame t+1
         board.push(first_move)
         img_t1 = render_board_svg(board=board, size=image_size)
 
@@ -128,16 +115,12 @@ def build_sample(
         "patch_size": 16,
     }
 
-    # Save to disk if output directory is provided
     if output_dir is not None:
         sample_dir = Path(output_dir) / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
 
         for img, fname in zip(images, saved_filenames):
             img.save(sample_dir / fname)
-
-        with open(sample_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
 
     return {"images": images, "metadata": metadata}
 
@@ -210,15 +193,16 @@ def generate_dataset(
     output_dir: Union[str, Path],
     image_size: int = 512,
 ) -> None:
-    """
-    Generates a batch dataset for a specific task using dataframe records.
-    """
+    """Generates a batch dataset for a specific task and creates a clean metadata.jsonl for Hugging Face ImageFolder."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    dataset_records = []
+
     for idx, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc=f"Generating {task}")):
         sample_id = f"sample_{idx:06d}"
-        build_sample(
+        
+        result = build_sample(
             fen=row["FEN"],
             moves=row.get("Moves", None),
             task=task,
@@ -227,3 +211,25 @@ def generate_dataset(
             output_dir=output_path,
             image_size=image_size,
         )
+
+        metadata = result["metadata"]
+        saved_files = metadata["image_files"]
+
+        # Base record with uniform schema across all tasks to prevent CastError
+        record = {
+            "sample_id": sample_id,
+            "puzzle_id": metadata["puzzle_id"],
+            "task": task,
+            "fen": metadata["fen"],
+            "prompt": metadata["prompt"],
+            "target": metadata["target"],
+            "file_name": f"{sample_id}/{saved_files[0]}",
+            "file_name_t1": f"{sample_id}/{saved_files[1]}" if len(saved_files) > 1 else ""
+        }
+
+        dataset_records.append(record)
+
+    metadata_file_path = output_path / "metadata.jsonl"
+    with open(metadata_file_path, "w", encoding="utf-8") as f:
+        for record in dataset_records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
