@@ -9,6 +9,46 @@ from tqdm import tqdm
 from transformers import AutoModelForImageTextToText, Trainer, TrainingArguments
 from peft import get_peft_model
 from functools import partial
+from torch.utils.data import DataLoader
+
+class Qwen35VisionDataCollator:
+    def __init__(self, processor):
+        self.processor = processor
+        self.pad_token_id = processor.tokenizer.pad_token_id
+
+    def __call__(self, examples):
+        # Convert lists saved by .map() back to PyTorch tensors
+        input_ids = [torch.tensor(ex["input_ids"]) if not isinstance(ex["input_ids"], torch.Tensor) else ex["input_ids"] for ex in examples]
+        labels = [torch.tensor(ex["labels"]) if not isinstance(ex["labels"], torch.Tensor) else ex["labels"] for ex in examples]
+        attention_mask = [torch.tensor(ex["attention_mask"]) if not isinstance(ex["attention_mask"], torch.Tensor) else ex["attention_mask"] for ex in examples]
+        
+        # Pad text sequences
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+        attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
+        
+        batch = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+        }
+        
+        # Handle mm_token_type_ids (pad with 0)
+        if "mm_token_type_ids" in examples[0] and examples[0]["mm_token_type_ids"] is not None:
+            mm_token_type_ids = [torch.tensor(ex["mm_token_type_ids"]) if not isinstance(ex["mm_token_type_ids"], torch.Tensor) else ex["mm_token_type_ids"] for ex in examples]
+            batch["mm_token_type_ids"] = torch.nn.utils.rnn.pad_sequence(mm_token_type_ids, batch_first=True, padding_value=0)
+        
+        # Handle pixel_values
+        if "pixel_values" in examples[0] and examples[0]["pixel_values"] is not None:
+            pixel_values_list = [torch.tensor(ex["pixel_values"]) if not isinstance(ex["pixel_values"], torch.Tensor) else ex["pixel_values"] for ex in examples]
+            batch["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+            
+        # Handle image_grid_thw (concatenation along dimension 0)
+        if "image_grid_thw" in examples[0] and examples[0]["image_grid_thw"] is not None:
+            grid_list = [torch.tensor(ex["image_grid_thw"]) if not isinstance(ex["image_grid_thw"], torch.Tensor) else ex["image_grid_thw"] for ex in examples]
+            batch["image_grid_thw"] = torch.cat(grid_list, dim=0)
+
+        return batch
 
 
 def calculate_fen_exact_match(predicted_fen: str, ground_truth_fen: str) -> float:
@@ -500,7 +540,6 @@ def reorder_chessboard_image(image, strategy="raster", grid_size=8):
 
 
 
-
 def finetune_and_push_chessboard_model(
     strategy_name,
     dataset,
@@ -511,126 +550,129 @@ def finetune_and_push_chessboard_model(
     hf_org_prefix="bdatm-project",
     repo_root=None,
 ):
-  print(f"\n==============================================")
-  print(
-      f"Starting pipeline for TASK: {task.upper()} | STRATEGY:"
-      f" {strategy_name.upper()}"
-  )
-  print(f"==============================================")
+    print(f"\n==============================================")
+    print(
+        f"Starting pipeline for TASK: {task.upper()} | STRATEGY:"
+        f" {strategy_name.upper()}"
+    )
+    print(f"==============================================")
 
-  # 1. Apply image-level reordering based on the task type
-  print(
-      f"Applying {strategy_name} reordering to datasets for {task}..."
-  )
+    # 1. Apply image-level reordering based on the task type
+    print(
+        f"Applying {strategy_name} reordering to datasets for {task}..."
+    )
 
-  def reorder_split(split_ds):
-    def transform(sample):
-      if task in ["task1", "task2"]:
-        # Single-image tasks
-        img = sample["image"]
-        reordered_img = reorder_chessboard_image(
-            img, strategy=strategy_name, grid_size=8
-        )
-        return {"image": reordered_img}
+    def reorder_split(split_ds):
+        def transform(sample):
+            if task in ["task1", "task2"]:
+                # Single-image tasks
+                img = sample["image"]
+                reordered_img = reorder_chessboard_image(
+                    img, strategy=strategy_name, grid_size=8
+                )
+                return {"image": reordered_img}
 
-      elif task == "task3":
-        # Dual-image task (reorder both frame t and frame t+1)
-        img_t = sample["image"]
-        reordered_img_t = reorder_chessboard_image(
-            img_t, strategy=strategy_name, grid_size=8
-        )
+            elif task == "task3":
+                # Dual-image task (reorder both frame t and frame t+1)
+                img_t = sample["image"]
+                reordered_img_t = reorder_chessboard_image(
+                    img_t, strategy=strategy_name, grid_size=8
+                )
 
-        # Handle second frame
-        t1_path = sample.get("file_name_t1")
-        if isinstance(t1_path, str) and t1_path.strip() != "":
-          img_t1_path = (
-              Path(repo_root) / t1_path if repo_root else Path(t1_path)
-          )
-          img_t1 = Image.open(img_t1_path).convert("RGB")
-        else:
-          img_t1 = sample.get("image_t1") or t1_path
+                # Handle second frame
+                t1_path = sample.get("file_name_t1")
+                if isinstance(t1_path, str) and t1_path.strip() != "":
+                    img_t1_path = (
+                        Path(repo_root) / t1_path if repo_root else Path(t1_path)
+                    )
+                    img_t1 = Image.open(img_t1_path).convert("RGB")
+                else:
+                    img_t1 = sample.get("image_t1") or t1_path
 
-        reordered_img_t1 = reorder_chessboard_image(
-            img_t1, strategy=strategy_name, grid_size=8
-        )
+                reordered_img_t1 = reorder_chessboard_image(
+                    img_t1, strategy=strategy_name, grid_size=8
+                )
 
-        # Return both reordered frames
-        return {"image": reordered_img_t, "image_t1": reordered_img_t1}
-      else:
-        raise ValueError(f"Unknown task: {task}")
+                # Return both reordered frames
+                return {"image": reordered_img_t, "image_t1": reordered_img_t1}
+            else:
+                raise ValueError(f"Unknown task: {task}")
 
-    return split_ds.map(transform)
+        return split_ds.map(transform)
 
-  reordered_train = reorder_split(dataset["train"])
-  reordered_val = reorder_split(dataset["validation"])
+    reordered_train = reorder_split(dataset["train"])
+    reordered_val = reorder_split(dataset["validation"])
 
-  # 2. Tokenize and preprocess the reordered datasets using the unified preprocessing function
-  print("Preprocessing datasets...")
-  tokenized_train = reordered_train.map(
-      partial(
-          preprocess_function, processor=processor, repo_root=repo_root
-      ),
-      remove_columns=reordered_train.column_names,
-  )
-  tokenized_val = reordered_val.map(
-      partial(
-          preprocess_function, processor=processor, repo_root=repo_root
-      ),
-      remove_columns=reordered_val.column_names,
-  )
+    # 2. Tokenize and preprocess the reordered datasets using the unified preprocessing function
+    print("Preprocessing datasets...")
+    tokenized_train = reordered_train.map(
+        partial(
+            preprocess_function, processor=processor, repo_root=repo_root
+        ),
+        remove_columns=reordered_train.column_names,
+    )
+    tokenized_val = reordered_val.map(
+        partial(
+            preprocess_function, processor=processor, repo_root=repo_root
+        ),
+        remove_columns=reordered_val.column_names,
+    )
 
-  # 3. Load a fresh base model instance and apply PEFT/LoRA
-  print("Loading base model and applying LoRA...")
-  model_instance = AutoModelForImageTextToText.from_pretrained(
-      base_model_id,
-      torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-      device_map="auto",
-  )
-  lora_model_instance = get_peft_model(model_instance, peft_config)
+    # 3. Load a fresh base model instance and apply PEFT/LoRA
+    print("Loading base model and applying LoRA...")
+    model_instance = AutoModelForImageTextToText.from_pretrained(
+        base_model_id,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
+    )
+    lora_model_instance = get_peft_model(model_instance, peft_config)
 
-  # 4. Configure Training Arguments for this specific run
-  training_args_instance = TrainingArguments(
-      output_dir=f"./temp_{task}_{strategy_name}_output",
-      per_device_train_batch_size=1,
-      per_device_eval_batch_size=1,
-      gradient_accumulation_steps=8,
-      learning_rate=2e-4,
-      logging_steps=10,
-      num_train_epochs=2,
-      save_strategy="epoch",
-      eval_strategy="epoch",
-      fp16=True,
-      remove_unused_columns=False,
-      report_to="none",
-  )
+    # 4. Configure Training Arguments for this specific run
+    training_args_instance = TrainingArguments(
+        output_dir=f"./temp_{task}_{strategy_name}_output",
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=8,
+        learning_rate=2e-4,
+        logging_steps=10,
+        num_train_epochs=2,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        fp16=True,
+        remove_unused_columns=False,
+        report_to="none",
+    )
 
-  # 5. Initialize Trainer
-  trainer_instance = Trainer(
-      model=lora_model_instance,
-      args=training_args_instance,
-      train_dataset=tokenized_train,
-      eval_dataset=tokenized_val,
-  )
+    # 5. Initialize Data Collator and Trainer
+    data_collator = Qwen35VisionDataCollator(processor=processor)
 
-  # 6. Train the model
-  print(f"Training model for {task} with {strategy_name} reordering...")
-  trainer_instance.train()
+    trainer_instance = Trainer(
+        model=lora_model_instance,
+        args=training_args_instance,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        data_collator=data_collator,
+    )
 
-  # 7. Push final weights and processor directly to Hugging Face Hub
-  repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
-  print(
-      f"Pushing model and processor to Hugging Face Hub: {repo_id_target}..."
-  )
+    # 6. Train the model
+    print(f"Training model for {task} with {strategy_name} reordering...")
+    trainer_instance.train()
 
-  trainer_instance.model.push_to_hub(
-      repo_id_target,
-      commit_message=(
-          f"Training complete for {task} using {strategy_name} reordering"
-          " strategy"
-      ),
-  )
-  processor.push_to_hub(repo_id_target)
+    # 7. Push final weights and processor directly to Hugging Face Hub
+    repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
+    print(
+        f"Pushing model and processor to Hugging Face Hub: {repo_id_target}..."
+    )
 
-  print(f"Finished! Successfully uploaded to Hub: {repo_id_target}")
+    trainer_instance.model.push_to_hub(
+        repo_id_target,
+        commit_message=(
+            f"Training complete for {task} using {strategy_name} reordering"
+            " strategy"
+        ),
+    )
+    processor.push_to_hub(repo_id_target)
 
-  return trainer_instance.model
+    print(f"Finished! Successfully uploaded to Hub: {repo_id_target}")
+
+    return trainer_instance.model
