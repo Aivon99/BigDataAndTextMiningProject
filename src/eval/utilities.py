@@ -357,7 +357,7 @@ def preprocess_function(sample, processor):
     elif task == "task3":
         img_t = sample.get("image") or sample.get("image_t")
         img_t1 = sample.get("image_t1")
-        
+
         chat_messages = [
             {
                 "role": "user",
@@ -379,7 +379,7 @@ def preprocess_function(sample, processor):
     else:
         raise ValueError(f"Unsupported task type: '{task}'")
 
-    # Genera la stringa tramite il template nativo di Qwen2.5-VL
+    # Genera la stringa tramite il template nativo
     text = processor.apply_chat_template(
         chat_messages, 
         tokenize=False, 
@@ -394,15 +394,26 @@ def preprocess_function(sample, processor):
         return_tensors="pt"
     )
 
-    # Rimuovi la dimensione del batch iniziale
-    batch = {k: v[0] for k, v in batch.items()}
-    
-    # Configura i labels per il Causal LM
-    batch["labels"] = batch["input_ids"].clone()
-    if processor.tokenizer.pad_token_id is not None:
-        batch["labels"][batch["labels"] == processor.tokenizer.pad_token_id] = -100
+    # Estrazione sicura dei tensori rimuovendo la dimensione del batch iniziale
+    result = {
+        "input_ids": batch["input_ids"][0],
+        "attention_mask": batch["attention_mask"][0],
+        "pixel_values": batch["pixel_values"],
+    }
 
-    return batch
+    if "mm_token_type_ids" in batch:
+        result["mm_token_type_ids"] = batch["mm_token_type_ids"][0]
+
+    if "image_grid_thw" in batch:
+        result["image_grid_thw"] = batch["image_grid_thw"]
+
+    # Configura i labels per il Causal LM
+    labels = result["input_ids"].clone()
+    if processor.tokenizer.pad_token_id is not None:
+        labels[labels == processor.tokenizer.pad_token_id] = -100
+    result["labels"] = labels
+
+    return result
 
 
 def get_patch_reordering_indices(strategy="raster", grid_size=8):
