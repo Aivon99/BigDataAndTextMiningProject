@@ -544,9 +544,9 @@ def finetune_and_push_chessboard_model(
     strategy_name,
     dataset,
     processor,
+    model,
     peft_config,
     task,
-    base_model_id="Qwen/Qwen3.5-0.8B",
     hf_org_prefix="bdatm-project",
     repo_root=None,
 ):
@@ -593,7 +593,6 @@ def finetune_and_push_chessboard_model(
 
         return split_ds.map(transform)
 
-
     reordered_train = reorder_split(dataset["train"])
     reordered_val = reorder_split(dataset["validation"])
 
@@ -612,14 +611,9 @@ def finetune_and_push_chessboard_model(
         remove_columns=reordered_val.column_names,
     )
 
-    # 3. Load a fresh base model instance and apply PEFT/LoRA
-    print("Loading base model and applying LoRA...")
-    model_instance = AutoModelForImageTextToText.from_pretrained(
-        base_model_id,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-    )
-    lora_model_instance = get_peft_model(model_instance, peft_config)
+    # 3. Apply PEFT/LoRA to the provided model instance
+    print("Applying LoRA to the provided model...")
+    lora_model_instance = get_peft_model(model, peft_config)
 
     # 4. Configure Training Arguments for this specific run
     training_args_instance = TrainingArguments(
