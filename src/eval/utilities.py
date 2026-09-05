@@ -601,13 +601,13 @@ def finetune_and_push_chessboard_model(
     print("Preprocessing datasets...")
     tokenized_train = reordered_train.map(
         partial(
-            preprocess_function, processor=processor, repo_root=repo_root
+            preprocess_function, processor=processor
         ),
         remove_columns=reordered_train.column_names,
     )
     tokenized_val = reordered_val.map(
         partial(
-            preprocess_function, processor=processor, repo_root=repo_root
+            preprocess_function, processor=processor
         ),
         remove_columns=reordered_val.column_names,
     )
