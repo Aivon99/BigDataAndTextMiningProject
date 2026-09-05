@@ -580,15 +580,8 @@ def finetune_and_push_chessboard_model(
                 )
 
                 # Handle second frame
+                img_t1 = sample["image_t1"]
                 t1_path = sample.get("file_name_t1")
-                if isinstance(t1_path, str) and t1_path.strip() != "":
-                    img_t1_path = (
-                        Path(repo_root) / t1_path if repo_root else Path(t1_path)
-                    )
-                    img_t1 = Image.open(img_t1_path).convert("RGB")
-                else:
-                    img_t1 = sample.get("image_t1") or t1_path
-
                 reordered_img_t1 = reorder_chessboard_image(
                     img_t1, strategy=strategy_name, grid_size=8
                 )
@@ -599,6 +592,7 @@ def finetune_and_push_chessboard_model(
                 raise ValueError(f"Unknown task: {task}")
 
         return split_ds.map(transform)
+
 
     reordered_train = reorder_split(dataset["train"])
     reordered_val = reorder_split(dataset["validation"])
