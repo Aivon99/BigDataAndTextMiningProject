@@ -106,3 +106,30 @@ def upload_dataset_to_hub(
 
     print(f"Dataset '{repo_id}' successfully synchronized!")
     return repo_id
+
+def set_all_seeds(seed_value=42):
+    """
+    Set the seed for reproducibility across all libraries (Python, NumPy, PyTorch, Transformers).
+    """
+    # Python standard library
+    random.seed(seed_value)
+    
+    # NumPy
+    np.random.seed(seed_value)
+    
+    # PyTorch 
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_value)
+        torch.cuda.manual_seed_all(seed_value)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # Hugging Face Transformers
+    set_seed(seed_value)
+
+    # Python environment hash seed
+    import os
+    os.environ["PYTHONHASHSEED"] = str(seed_value)
+    
+    print(f"All seeds successfully set to {seed_value} for full pipeline reproducibility.")
