@@ -9,6 +9,46 @@ from tqdm import tqdm
 from transformers import AutoModelForImageTextToText, Trainer, TrainingArguments
 from peft import get_peft_model
 from functools import partial
+from torch.utils.data import DataLoader
+
+class Qwen35VisionDataCollator:
+    def __init__(self, processor):
+        self.processor = processor
+        self.pad_token_id = processor.tokenizer.pad_token_id
+
+    def __call__(self, examples):
+        # Convert lists saved by .map() back to PyTorch tensors
+        input_ids = [torch.tensor(ex["input_ids"]) if not isinstance(ex["input_ids"], torch.Tensor) else ex["input_ids"] for ex in examples]
+        labels = [torch.tensor(ex["labels"]) if not isinstance(ex["labels"], torch.Tensor) else ex["labels"] for ex in examples]
+        attention_mask = [torch.tensor(ex["attention_mask"]) if not isinstance(ex["attention_mask"], torch.Tensor) else ex["attention_mask"] for ex in examples]
+        
+        # Pad text sequences
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+        attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
+        
+        batch = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+        }
+        
+        # Handle mm_token_type_ids (pad with 0)
+        if "mm_token_type_ids" in examples[0] and examples[0]["mm_token_type_ids"] is not None:
+            mm_token_type_ids = [torch.tensor(ex["mm_token_type_ids"]) if not isinstance(ex["mm_token_type_ids"], torch.Tensor) else ex["mm_token_type_ids"] for ex in examples]
+            batch["mm_token_type_ids"] = torch.nn.utils.rnn.pad_sequence(mm_token_type_ids, batch_first=True, padding_value=0)
+        
+        # Handle pixel_values
+        if "pixel_values" in examples[0] and examples[0]["pixel_values"] is not None:
+            pixel_values_list = [torch.tensor(ex["pixel_values"]) if not isinstance(ex["pixel_values"], torch.Tensor) else ex["pixel_values"] for ex in examples]
+            batch["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+            
+        # Handle image_grid_thw (concatenation along dimension 0)
+        if "image_grid_thw" in examples[0] and examples[0]["image_grid_thw"] is not None:
+            grid_list = [torch.tensor(ex["image_grid_thw"]) if not isinstance(ex["image_grid_thw"], torch.Tensor) else ex["image_grid_thw"] for ex in examples]
+            batch["image_grid_thw"] = torch.cat(grid_list, dim=0)
+
+        return batch
 
 
 def calculate_fen_exact_match(predicted_fen: str, ground_truth_fen: str) -> float:
@@ -243,20 +283,100 @@ def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name
 
     return results_df, model_summary_df
 
-def preprocess_function(sample, processor, repo_root=None):
+
+def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name: str) -> pd.DataFrame:
     """
-    Unified preprocessing function for Vision-Language Models (Qwen-VL).
-    Dynamically handles Task 1, Task 2, and Task 3 based on the 'task' field in the sample.
+    Evaluates a given VLM model (vanilla or fine-tuned) on the chessboard Task 3 dataset 
+    (Dual-Image Delta Move) and returns a DataFrame containing predictions, metrics, and aggregate results.
     """
+    model.eval()
+    results_list = []
+
+    # Iterate over the dataset split
+    for test_sample in tqdm(dataset_split, desc=f"Evaluating {model_name} on Task 3"):
+        # 1. Extract fields from the sample based on the dataset structure
+        task_prompt = test_sample["prompt"]
+        ground_truth_move = test_sample["target"]
+        sample_id = test_sample["sample_id"]
+        
+        # Frame 1 (State t) and Frame 2 (State t+1) images
+        frame_t_image = test_sample["image"]
+        frame_t_plus_1_image = test_sample["image_t1"]
+
+        # 2. Prepare the multimodal input format for the model chat with two images
+        chat_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": frame_t_image},
+                    {"type": "image", "image": frame_t_plus_1_image},
+                    {"type": "text", "text": task_prompt},
+                ]
+            }
+        ]
+
+        # 3. Apply the processor's chat template
+        formatted_text = processor.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
+
+        # 4. Tokenize inputs and pass both images as a list, then move them to the model's device
+        model_inputs = processor(
+            text=[formatted_text],
+            images=[frame_t_image, frame_t_plus_1_image],
+            padding=True,
+            return_tensors="pt"
+        ).to(model.device)
+
+        # 5. Generate the prediction
+        with torch.no_grad():
+            output_token_ids = model.generate(**model_inputs, max_new_tokens=128)
+
+        # 6. Trim prompt tokens from the generated output
+        trimmed_output_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, output_token_ids)
+        ]
+        predicted_move_string = processor.batch_decode(
+            trimmed_output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
+
+        # 7. Compute Exact Match (EM) metric using the predefined function
+        exact_match = calculate_san_exact_match(predicted_move_string, ground_truth_move)
+
+        # 8. Append row data including predictions and metrics
+        results_list.append({
+            "sample_id": sample_id,
+            "ground_truth": ground_truth_move,
+            "predicted": predicted_move_string,
+            "exact_match": exact_match
+        })
+
+    # Convert results into a Pandas DataFrame
+    results_df = pd.DataFrame(results_list)
+    
+    # Save sample-level results to CSV
+    csv_filename = f"task3_{model_name.lower().replace(' ', '_')}_results.csv"
+    results_df.to_csv(csv_filename, index=False)
+    print(f"\nEvaluation completed for {model_name} on Task 3! Results saved to {csv_filename}.")
+
+    # Compute global aggregate metrics across the dataset split
+    mean_em = results_df["exact_match"].mean()
+
+    # Create the model summary row for the global comparison table (omitting the task number)
+    model_summary_df = pd.DataFrame([
+        {
+            "model_name": model_name,
+            "exact_match": mean_em
+        }
+    ])
+
+    return results_df, model_summary_df
+
+def preprocess_function(sample, processor):
     task = sample.get("task", "task1")
     prompt_text = sample["prompt"]
     target_text = sample["target"]
 
-    # Configure multi-modal content based on the active task
     if task in ["task1", "task2"]:
-        # Single-image tasks (Task 1: FEN extraction, Task 2: Highlighted move prediction)
         board_image = sample["image"]
-
         chat_messages = [
             {
                 "role": "user",
@@ -275,19 +395,8 @@ def preprocess_function(sample, processor, repo_root=None):
         images_input = [board_image]
 
     elif task == "task3":
-        # Dual-image task (Task 3: Temporal reasoning between State t and State t+1)
         img_t = sample.get("image") or sample.get("image_t")
-
-        # Handle second frame: if stored as a string path in metadata, load it with PIL
-        t1_path = sample.get("file_name_t1")
-        if isinstance(t1_path, str) and t1_path.strip() != "":
-            if repo_root is not None:
-                img_t1_path = Path(repo_root) / t1_path
-            else:
-                img_t1_path = Path(t1_path)
-            img_t1 = Image.open(img_t1_path).convert("RGB")
-        else:
-            img_t1 = sample.get("image_t1") or t1_path
+        img_t1 = sample.get("image_t1")
 
         chat_messages = [
             {
@@ -308,27 +417,44 @@ def preprocess_function(sample, processor, repo_root=None):
         images_input = [img_t, img_t1]
 
     else:
-        raise ValueError(f"Unsupported task type found in sample: '{task}'")
+        raise ValueError(f"Unsupported task type: '{task}'")
 
-    # Apply the processor's chat template
-    text = processor.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=False)
+    # Genera la stringa tramite il template nativo
+    text = processor.apply_chat_template(
+        chat_messages, 
+        tokenize=False, 
+        add_generation_prompt=False
+    )
 
-    # Tokenize text and process images together
+    # Processa testo e immagini insieme
     batch = processor(
         text=[text],
         images=images_input,
-        padding="max_length",
-        max_length=512,
-        truncation=True,
+        padding=False,
         return_tensors="pt"
     )
 
-    # Clean up dimensions and set up labels for causal language modeling training
-    batch = {k: v[0] for k, v in batch.items()}
-    batch["labels"] = batch["input_ids"].clone()
-    batch["labels"][batch["labels"] == processor.tokenizer.pad_token_id] = -100
+    # Estrazione sicura dei tensori rimuovendo la dimensione del batch iniziale
+    result = {
+        "input_ids": batch["input_ids"][0],
+        "attention_mask": batch["attention_mask"][0],
+        "pixel_values": batch["pixel_values"],
+    }
 
-    return batch
+    if "mm_token_type_ids" in batch:
+        result["mm_token_type_ids"] = batch["mm_token_type_ids"][0]
+
+    if "image_grid_thw" in batch:
+        result["image_grid_thw"] = batch["image_grid_thw"]
+
+    # Configura i labels per il Causal LM
+    labels = result["input_ids"].clone()
+    if processor.tokenizer.pad_token_id is not None:
+        labels[labels == processor.tokenizer.pad_token_id] = -100
+    result["labels"] = labels
+
+    return result
+
 
 def get_patch_reordering_indices(strategy="raster", grid_size=8):
     """
@@ -414,137 +540,127 @@ def reorder_chessboard_image(image, strategy="raster", grid_size=8):
 
 
 
-
 def finetune_and_push_chessboard_model(
     strategy_name,
     dataset,
     processor,
+    model,
     peft_config,
     task,
-    base_model_id="Qwen/Qwen3.5-0.8B",
     hf_org_prefix="bdatm-project",
     repo_root=None,
 ):
-  print(f"\n==============================================")
-  print(
-      f"Starting pipeline for TASK: {task.upper()} | STRATEGY:"
-      f" {strategy_name.upper()}"
-  )
-  print(f"==============================================")
+    print(f"\n==============================================")
+    print(
+        f"Starting pipeline for TASK: {task.upper()} | STRATEGY:"
+        f" {strategy_name.upper()}"
+    )
+    print(f"==============================================")
 
-  # 1. Apply image-level reordering based on the task type
-  print(
-      f"Applying {strategy_name} reordering to datasets for {task}..."
-  )
+    # 1. Apply image-level reordering based on the task type
+    print(
+        f"Applying {strategy_name} reordering to datasets for {task}..."
+    )
 
-  def reorder_split(split_ds):
-    def transform(sample):
-      if task in ["task1", "task2"]:
-        # Single-image tasks
-        img = sample["image"]
-        reordered_img = reorder_chessboard_image(
-            img, strategy=strategy_name, grid_size=8
-        )
-        return {"image": reordered_img}
+    def reorder_split(split_ds):
+        def transform(sample):
+            if task in ["task1", "task2"]:
+                # Single-image tasks
+                img = sample["image"]
+                reordered_img = reorder_chessboard_image(
+                    img, strategy=strategy_name, grid_size=8
+                )
+                return {"image": reordered_img}
 
-      elif task == "task3":
-        # Dual-image task (reorder both frame t and frame t+1)
-        img_t = sample["image"]
-        reordered_img_t = reorder_chessboard_image(
-            img_t, strategy=strategy_name, grid_size=8
-        )
+            elif task == "task3":
+                # Dual-image task (reorder both frame t and frame t+1)
+                img_t = sample["image"]
+                reordered_img_t = reorder_chessboard_image(
+                    img_t, strategy=strategy_name, grid_size=8
+                )
 
-        # Handle second frame
-        t1_path = sample.get("file_name_t1")
-        if isinstance(t1_path, str) and t1_path.strip() != "":
-          img_t1_path = (
-              Path(repo_root) / t1_path if repo_root else Path(t1_path)
-          )
-          img_t1 = Image.open(img_t1_path).convert("RGB")
-        else:
-          img_t1 = sample.get("image_t1") or t1_path
+                # Handle second frame
+                img_t1 = sample["image_t1"]
+                t1_path = sample.get("file_name_t1")
+                reordered_img_t1 = reorder_chessboard_image(
+                    img_t1, strategy=strategy_name, grid_size=8
+                )
 
-        reordered_img_t1 = reorder_chessboard_image(
-            img_t1, strategy=strategy_name, grid_size=8
-        )
+                # Return both reordered frames
+                return {"image": reordered_img_t, "image_t1": reordered_img_t1}
+            else:
+                raise ValueError(f"Unknown task: {task}")
 
-        # Return both reordered frames
-        return {"image": reordered_img_t, "image_t1": reordered_img_t1}
-      else:
-        raise ValueError(f"Unknown task: {task}")
+        return split_ds.map(transform)
 
-    return split_ds.map(transform)
+    reordered_train = reorder_split(dataset["train"])
+    reordered_val = reorder_split(dataset["validation"])
 
-  reordered_train = reorder_split(dataset["train"])
-  reordered_val = reorder_split(dataset["validation"])
+    # 2. Tokenize and preprocess the reordered datasets using the unified preprocessing function
+    print("Preprocessing datasets...")
+    tokenized_train = reordered_train.map(
+        partial(
+            preprocess_function, processor=processor
+        ),
+        remove_columns=reordered_train.column_names,
+    )
+    tokenized_val = reordered_val.map(
+        partial(
+            preprocess_function, processor=processor
+        ),
+        remove_columns=reordered_val.column_names,
+    )
 
-  # 2. Tokenize and preprocess the reordered datasets using the unified preprocessing function
-  print("Preprocessing datasets...")
-  tokenized_train = reordered_train.map(
-      partial(
-          preprocess_function, processor=processor, repo_root=repo_root
-      ),
-      remove_columns=reordered_train.column_names,
-  )
-  tokenized_val = reordered_val.map(
-      partial(
-          preprocess_function, processor=processor, repo_root=repo_root
-      ),
-      remove_columns=reordered_val.column_names,
-  )
+    # 3. Apply PEFT/LoRA to the provided model instance
+    print("Applying LoRA to the provided model...")
+    lora_model_instance = get_peft_model(model, peft_config)
 
-  # 3. Load a fresh base model instance and apply PEFT/LoRA
-  print("Loading base model and applying LoRA...")
-  model_instance = AutoModelForImageTextToText.from_pretrained(
-      base_model_id,
-      torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-      device_map="auto",
-  )
-  lora_model_instance = get_peft_model(model_instance, peft_config)
+    # 4. Configure Training Arguments for this specific run
+    training_args_instance = TrainingArguments(
+        output_dir=f"./temp_{task}_{strategy_name}_output",
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=8,
+        learning_rate=2e-4,
+        logging_steps=10,
+        num_train_epochs=2,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        fp16=True,
+        remove_unused_columns=False,
+        report_to="none",
+    )
 
-  # 4. Configure Training Arguments for this specific run
-  training_args_instance = TrainingArguments(
-      output_dir=f"./temp_{task}_{strategy_name}_output",
-      per_device_train_batch_size=1,
-      per_device_eval_batch_size=1,
-      gradient_accumulation_steps=8,
-      learning_rate=2e-4,
-      logging_steps=10,
-      num_train_epochs=2,
-      save_strategy="epoch",
-      eval_strategy="epoch",
-      fp16=True,
-      remove_unused_columns=False,
-      report_to="none",
-  )
+    # 5. Initialize Data Collator and Trainer
+    data_collator = Qwen35VisionDataCollator(processor=processor)
 
-  # 5. Initialize Trainer
-  trainer_instance = Trainer(
-      model=lora_model_instance,
-      args=training_args_instance,
-      train_dataset=tokenized_train,
-      eval_dataset=tokenized_val,
-  )
+    trainer_instance = Trainer(
+        model=lora_model_instance,
+        args=training_args_instance,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        data_collator=data_collator,
+    )
 
-  # 6. Train the model
-  print(f"Training model for {task} with {strategy_name} reordering...")
-  trainer_instance.train()
+    # 6. Train the model
+    print(f"Training model for {task} with {strategy_name} reordering...")
+    trainer_instance.train()
 
-  # 7. Push final weights and processor directly to Hugging Face Hub
-  repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
-  print(
-      f"Pushing model and processor to Hugging Face Hub: {repo_id_target}..."
-  )
+    # 7. Push final weights and processor directly to Hugging Face Hub
+    repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
+    print(
+        f"Pushing model and processor to Hugging Face Hub: {repo_id_target}..."
+    )
 
-  trainer_instance.model.push_to_hub(
-      repo_id_target,
-      commit_message=(
-          f"Training complete for {task} using {strategy_name} reordering"
-          " strategy"
-      ),
-  )
-  processor.push_to_hub(repo_id_target)
+    trainer_instance.model.push_to_hub(
+        repo_id_target,
+        commit_message=(
+            f"Training complete for {task} using {strategy_name} reordering"
+            " strategy"
+        ),
+    )
+    processor.push_to_hub(repo_id_target)
 
-  print(f"Finished! Successfully uploaded to Hub: {repo_id_target}")
+    print(f"Finished! Successfully uploaded to Hub: {repo_id_target}")
 
-  return trainer_instance.model
+    return trainer_instance.model
