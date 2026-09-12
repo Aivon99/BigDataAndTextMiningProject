@@ -1,5 +1,7 @@
 import io
 import json
+import multiprocessing
+import os
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Union
 
@@ -233,3 +235,99 @@ def generate_dataset(
     with open(metadata_file_path, "w", encoding="utf-8") as f:
         for record in dataset_records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _render_sample_to_disk(args: tuple) -> dict:
+    """
+    Worker entry point for `generate_datasets_parallel`. Renders one sample
+    straight to disk via `build_sample` and returns only its metadata dict —
+    never the PIL images — so results stay cheap to ship back from a worker
+    process to the main one over IPC.
+    """
+    fen, task, sample_id, moves, puzzle_id, output_dir, image_size = args
+    result = build_sample(
+        fen=fen,
+        task=task,
+        sample_id=sample_id,
+        moves=moves,
+        puzzle_id=puzzle_id,
+        output_dir=output_dir,
+        image_size=image_size,
+    )
+    return result["metadata"]
+
+
+def generate_datasets_parallel(
+    task_splits: Dict[str, Dict[str, pd.DataFrame]],
+    output_root: Union[str, Path] = ".",
+    image_size: int = 512,
+    num_workers: Optional[int] = None,
+) -> None:
+    """
+    Generates every (task, split) dataset in `task_splits` using a single
+    pool of worker processes, instead of looping over tasks and splits one
+    at a time. Each worker renders one sample directly to disk; the
+    per-(task, split) `metadata.jsonl` files are written once, from the main
+    process, after the whole pool has finished.
+
+    `task_splits` is a mapping like {"task1": {"train": df, ...}, "task2": ...}.
+    The same `splits` dict can be reused for every task, since a given puzzle
+    row is independent across tasks.
+    """
+    output_root = Path(output_root)
+
+    work_items: List[tuple] = []
+    job_dirs: List[Path] = []  # parallel to work_items: output_dir for each item
+
+    for task, splits in task_splits.items():
+        for split_name, split_df in splits.items():
+            output_dir = output_root / f"dataset_{task}" / split_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            for idx, (_, row) in enumerate(split_df.iterrows()):
+                sample_id = f"sample_{idx:06d}"
+                work_items.append((
+                    row["FEN"],
+                    task,
+                    sample_id,
+                    row.get("Moves", None),
+                    str(row.get("PuzzleId", sample_id)),
+                    output_dir,
+                    image_size,
+                ))
+                job_dirs.append(output_dir)
+
+    num_workers = num_workers or os.cpu_count() or 1
+    print(
+        f"Rendering {len(work_items)} samples across {len(task_splits)} task(s) "
+        f"using {num_workers} worker process(es)..."
+    )
+
+    records_by_dir: Dict[Path, List[dict]] = {}
+    with multiprocessing.Pool(num_workers) as pool:
+        results = pool.imap(_render_sample_to_disk, work_items, chunksize=8)
+        for output_dir, metadata in tqdm(
+            zip(job_dirs, results), total=len(work_items), desc="Generating datasets"
+        ):
+            record = {
+                "sample_id": metadata["sample_id"],
+                "puzzle_id": metadata["puzzle_id"],
+                "task": metadata["task"],
+                "fen": metadata["fen"],
+                "prompt": metadata["prompt"],
+                "target": metadata["target"],
+                "file_name": f"{metadata['sample_id']}/{metadata['image_files'][0]}",
+                "file_name_t1": (
+                    f"{metadata['sample_id']}/{metadata['image_files'][1]}"
+                    if len(metadata["image_files"]) > 1 else ""
+                ),
+            }
+            records_by_dir.setdefault(output_dir, []).append(record)
+
+    for output_dir, records in records_by_dir.items():
+        metadata_path = output_dir / "metadata.jsonl"
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    print("All task/split datasets generated.")
