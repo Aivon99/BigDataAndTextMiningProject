@@ -16,7 +16,11 @@ python-dotenv
 # Chess rendering & serialization
 chess
 cairosvg
-Pillow<11.0.0
+# NOTE: Task_1.ipynb's Qwen eval pipeline needs Pillow<11.0.0 specifically.
+# That cap has no prebuilt wheel on newer Python versions (e.g. 3.13/3.14),
+# forcing a from-source build; left unpinned here for the general/data-gen
+# path, pin it back down manually if you're running that notebook's env.
+Pillow
 
 # Data wrangling & metrics
 pandas
