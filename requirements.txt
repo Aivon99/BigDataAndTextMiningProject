@@ -1,0 +1,30 @@
+# Core deep learning stack
+torch
+torchvision
+torchaudio
+transformers>=4.45.0
+accelerate
+torchao
+peft
+qwen-vl-utils
+
+# Data / Hugging Face Hub
+datasets
+huggingface_hub
+python-dotenv
+
+# Chess rendering & serialization
+chess
+cairosvg
+Pillow<11.0.0
+
+# Data wrangling & metrics
+pandas
+numpy
+scikit-learn
+python-Levenshtein
+zstandard
+
+# Utilities / plotting
+tqdm
+matplotlib
