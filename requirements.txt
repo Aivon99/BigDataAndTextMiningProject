@@ -12,6 +12,7 @@ qwen-vl-utils
 datasets
 huggingface_hub
 python-dotenv
+PyYAML
 
 # Chess rendering & serialization
 chess

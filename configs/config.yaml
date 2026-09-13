@@ -1,1 +1,22 @@
-"colab" : False
+dataset_generation:
+  csv_path: "lichess_db_puzzle.csv"
+  random_seed: 42
+
+  # How many puzzle rows to sample from the full Lichess CSV before
+  # balancing. Clamped automatically to the CSV's actual row count if set
+  # too high — see load_lichess_csv() in src/data/utilities.py. Set well
+  # above n_per_turn * 2 so the initial sample is very likely to contain
+  # enough of both White- and Black-to-move puzzles.
+  max_samples: 20000
+
+  # How many White-to-move AND how many Black-to-move puzzles to keep
+  # (balanced 50/50); total balanced puzzles = n_per_turn * 2. Per the
+  # project spec (3,000-5,000 total puzzle records, balanced W/B), 2000
+  # gives 4000 total puzzles — this is the puzzle pool shared by all 3
+  # tasks (not per-task), so it yields 4000 * 3 = 12000 rendered images
+  # total. Must have max_samples >= n_per_turn * 2, and is clamped
+  # automatically down to whatever's actually available for the scarcer
+  # side — see clamp_balanced_turn_counts() in src/data/utilities.py.
+  n_per_turn: 2000
+
+  image_size: 512

@@ -257,11 +257,24 @@ def _render_sample_to_disk(args: tuple) -> dict:
     return result["metadata"]
 
 
+def _existing_sample_count(output_dir: Path) -> int:
+    """
+    Number of samples already recorded in `output_dir/metadata.jsonl`, or 0
+    if that file doesn't exist yet.
+    """
+    metadata_path = output_dir / "metadata.jsonl"
+    if not metadata_path.exists():
+        return 0
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
 def generate_datasets_parallel(
     task_splits: Dict[str, Dict[str, pd.DataFrame]],
     output_root: Union[str, Path] = ".",
     image_size: int = 512,
     num_workers: Optional[int] = None,
+    skip_existing: bool = True,
 ) -> None:
     """
     Generates every (task, split) dataset in `task_splits` using a single
@@ -273,6 +286,12 @@ def generate_datasets_parallel(
     `task_splits` is a mapping like {"task1": {"train": df, ...}, "task2": ...}.
     The same `splits` dict can be reused for every task, since a given puzzle
     row is independent across tasks.
+
+    If `skip_existing` is True (the default), a (task, split) combination is
+    skipped entirely when its output folder already has a `metadata.jsonl`
+    with exactly as many records as `split_df` has rows — so re-running this
+    after an interruption (a kernel restart, a network blip mid-upload, ...)
+    doesn't re-render work that's already on disk.
     """
     output_root = Path(output_root)
 
@@ -283,6 +302,13 @@ def generate_datasets_parallel(
         for split_name, split_df in splits.items():
             output_dir = output_root / f"dataset_{task}" / split_name
             output_dir.mkdir(parents=True, exist_ok=True)
+
+            if skip_existing and _existing_sample_count(output_dir) == len(split_df):
+                print(
+                    f"[{task}/{split_name}] already has {len(split_df)} sample(s) "
+                    f"matching the requested split size — skipping."
+                )
+                continue
 
             for idx, (_, row) in enumerate(split_df.iterrows()):
                 sample_id = f"sample_{idx:06d}"
@@ -296,6 +322,10 @@ def generate_datasets_parallel(
                     image_size,
                 ))
                 job_dirs.append(output_dir)
+
+    if not work_items:
+        print("Nothing to generate — every (task, split) combination is already up to date.")
+        return
 
     num_workers = num_workers or os.cpu_count() or 1
     print(
