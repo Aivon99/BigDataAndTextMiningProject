@@ -6,10 +6,46 @@ from pathlib import Path
 from PIL import Image
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForImageTextToText, Trainer, TrainingArguments
+from transformers import (
+    AutoModelForImageTextToText,
+    EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
+)
+from huggingface_hub import HfApi, snapshot_download
 from peft import get_peft_model
 from functools import partial
 from torch.utils.data import DataLoader
+
+
+def find_resumable_checkpoint(repo_id: str) -> str | None:
+    """
+    If `repo_id` already exists on the Hub and has a `last-checkpoint/`
+    folder (written by a previous `Trainer` run with
+    `hub_strategy="checkpoint"`), download it and return its local path —
+    pass that straight to `Trainer.train(resume_from_checkpoint=...)` to
+    pick training back up after an interruption (e.g. a Colab disconnect
+    wiping the local runtime) instead of starting over from epoch 0.
+    Returns None if there's nothing to resume from, so training starts fresh.
+    """
+    try:
+        api = HfApi()
+        if not api.repo_exists(repo_id=repo_id, repo_type="model"):
+            return None
+
+        local_dir = snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            allow_patterns="last-checkpoint/*",
+        )
+        candidate = Path(local_dir) / "last-checkpoint"
+        if candidate.exists() and any(candidate.iterdir()):
+            print(f"Found a resumable checkpoint on the Hub for '{repo_id}': {candidate}")
+            return str(candidate)
+    except Exception as e:
+        print(f"No resumable checkpoint found for '{repo_id}' ({e}); starting fresh.")
+
+    return None
 
 class Qwen35VisionDataCollator:
     def __init__(self, processor):
@@ -549,6 +585,8 @@ def finetune_and_push_chessboard_model(
     task,
     hf_org_prefix="bdatm-project",
     repo_root=None,
+    num_train_epochs=10,
+    early_stopping_patience=2,
 ):
     print(f"\n==============================================")
     print(
@@ -615,7 +653,19 @@ def finetune_and_push_chessboard_model(
     print("Applying LoRA to the provided model...")
     lora_model_instance = get_peft_model(model, peft_config)
 
-    # 4. Configure Training Arguments for this specific run
+    # 4. Resolve the target Hub repo now (needed before training starts) and
+    # check whether an earlier, interrupted run already left a resumable
+    # checkpoint there (e.g. after a Colab disconnect wiped the local runtime).
+    repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
+    resume_checkpoint = find_resumable_checkpoint(repo_id_target)
+
+    # 5. Configure Training Arguments for this specific run. Trains for up to
+    # `num_train_epochs`, but relies on the validation set (via
+    # EarlyStoppingCallback below) to stop once eval_loss stops improving,
+    # and to keep the best-performing checkpoint rather than just the last one.
+    # push_to_hub + hub_strategy="checkpoint" uploads a fully resumable
+    # checkpoint (optimizer/scheduler/RNG state included) after every epoch,
+    # so an interruption at epoch i loses at most that epoch's progress.
     training_args_instance = TrainingArguments(
         output_dir=f"./temp_{task}_{strategy_name}_output",
         per_device_train_batch_size=1,
@@ -623,15 +673,22 @@ def finetune_and_push_chessboard_model(
         gradient_accumulation_steps=8,
         learning_rate=2e-4,
         logging_steps=10,
-        num_train_epochs=2,
+        num_train_epochs=num_train_epochs,
         save_strategy="epoch",
         eval_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        save_total_limit=2,
+        push_to_hub=True,
+        hub_model_id=repo_id_target,
+        hub_strategy="checkpoint",
         fp16=True,
         remove_unused_columns=False,
         report_to="none",
     )
 
-    # 5. Initialize Data Collator and Trainer
+    # 6. Initialize Data Collator and Trainer
     data_collator = Qwen35VisionDataCollator(processor=processor)
 
     trainer_instance = Trainer(
@@ -640,14 +697,17 @@ def finetune_and_push_chessboard_model(
         train_dataset=tokenized_train,
         eval_dataset=tokenized_val,
         data_collator=data_collator,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)],
     )
 
-    # 6. Train the model
-    print(f"Training model for {task} with {strategy_name} reordering...")
-    trainer_instance.train()
+    # 7. Train (or resume) the model
+    if resume_checkpoint:
+        print(f"Resuming training for {task} ({strategy_name} reordering) from {resume_checkpoint}...")
+    else:
+        print(f"Training model for {task} with {strategy_name} reordering...")
+    trainer_instance.train(resume_from_checkpoint=resume_checkpoint)
 
-    # 7. Push final weights and processor directly to Hugging Face Hub
-    repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
+    # 8. Push final weights and processor directly to Hugging Face Hub
     print(
         f"Pushing model and processor to Hugging Face Hub: {repo_id_target}..."
     )
