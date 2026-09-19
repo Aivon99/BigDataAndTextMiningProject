@@ -89,6 +89,15 @@ class PlackettLucePatchPolicy(nn.Module):
 
         return sorted_indices, log_prob
 
+    def greedy_permutation(self) -> list:
+        """
+        The policy's single best-guess ordering (argsort of the learned
+        logits, no sampling noise) -- what to actually use at evaluation
+        time, since training samples stochastically but eval needs one fixed
+        ordering to reorder the test set with.
+        """
+        return torch.argsort(self.logits, descending=True).tolist()
+
     def update_baseline(self, reward: torch.Tensor) -> None:
         """Exponential-moving-average baseline for REINFORCE variance reduction."""
         with torch.no_grad():
