@@ -87,6 +87,37 @@ class Qwen35VisionDataCollator:
         return batch
 
 
+class Qwen35OnTheFlyCollator(Qwen35VisionDataCollator):
+    """
+    Takes RAW dataset rows (PIL `image`/`image_t1`, `prompt`, `target`, `task`)
+    and runs the image processor per batch, optionally reordering patches first.
+
+    Avoids `dataset.map(preprocess_function)`, which materialises every image's
+    `pixel_values` (~6 MB each at 512px, ~20 GB for a 3200-sample train split)
+    into an Arrow cache and forces the collator to rebuild tensors from nested
+    Python lists on every step. Use with `remove_unused_columns=False` and
+    `dataloader_num_workers > 0` so preprocessing overlaps with GPU compute.
+    """
+
+    def __init__(self, processor, strategy=None, grid_size=8):
+        super().__init__(processor)
+        self.strategy = strategy
+        self.grid_size = grid_size
+
+    def __call__(self, examples):
+        processed = []
+        for ex in examples:
+            ex = dict(ex)
+            if self.strategy is not None:
+                for key in ("image", "image_t1"):
+                    if ex.get(key) is not None:
+                        ex[key] = reorder_chessboard_image(
+                            ex[key], strategy=self.strategy, grid_size=self.grid_size
+                        )
+            processed.append(preprocess_function(ex, self.processor))
+        return super().__call__(processed)
+
+
 def calculate_fen_exact_match(predicted_fen: str, ground_truth_fen: str) -> float:
     """
     Calculates FEN Exact Match: returns 1.0 if the predicted FEN string 
@@ -606,59 +637,12 @@ def finetune_and_push_chessboard_model(
     )
     print(f"==============================================")
 
-    # 1. Apply image-level reordering based on the task type
-    print(
-        f"Applying {strategy_name} reordering to datasets for {task}..."
-    )
+    if task not in ("task1", "task2", "task3"):
+        raise ValueError(f"Unknown task: {task}")
 
-    def reorder_split(split_ds):
-        def transform(sample):
-            if task in ["task1", "task2"]:
-                # Single-image tasks
-                img = sample["image"]
-                reordered_img = reorder_chessboard_image(
-                    img, strategy=strategy_name, grid_size=8
-                )
-                return {"image": reordered_img}
-
-            elif task == "task3":
-                # Dual-image task (reorder both frame t and frame t+1)
-                img_t = sample["image"]
-                reordered_img_t = reorder_chessboard_image(
-                    img_t, strategy=strategy_name, grid_size=8
-                )
-
-                # Handle second frame
-                img_t1 = sample["image_t1"]
-                t1_path = sample.get("file_name_t1")
-                reordered_img_t1 = reorder_chessboard_image(
-                    img_t1, strategy=strategy_name, grid_size=8
-                )
-
-                # Return both reordered frames
-                return {"image": reordered_img_t, "image_t1": reordered_img_t1}
-            else:
-                raise ValueError(f"Unknown task: {task}")
-
-        return split_ds.map(transform)
-
-    reordered_train = reorder_split(dataset["train"])
-    reordered_val = reorder_split(dataset["validation"])
-
-    # 2. Tokenize and preprocess the reordered datasets using the unified preprocessing function
-    print("Preprocessing datasets...")
-    tokenized_train = reordered_train.map(
-        partial(
-            preprocess_function, processor=processor
-        ),
-        remove_columns=reordered_train.column_names,
-    )
-    tokenized_val = reordered_val.map(
-        partial(
-            preprocess_function, processor=processor
-        ),
-        remove_columns=reordered_val.column_names,
-    )
+    # 1-2. Reordering and preprocessing happen on the fly inside the collator
+    # (both frames for task3), so no reordered/tokenized copy of the dataset
+    # is ever materialised on disk.
 
     # 3. Apply PEFT/LoRA to the provided model instance
     print("Applying LoRA to the provided model...")
@@ -679,9 +663,9 @@ def finetune_and_push_chessboard_model(
     # so an interruption at epoch i loses at most that epoch's progress.
     training_args_instance = TrainingArguments(
         output_dir=f"./temp_{task}_{strategy_name}_output",
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        gradient_accumulation_steps=1,
         learning_rate=2e-4,
         logging_steps=10,
         num_train_epochs=num_train_epochs,
@@ -694,19 +678,20 @@ def finetune_and_push_chessboard_model(
         push_to_hub=True,
         hub_model_id=repo_id_target,
         hub_strategy="checkpoint",
-        fp16=True,
+        bf16=True,
+        dataloader_num_workers=4,
         remove_unused_columns=False,
         report_to="none",
     )
 
     # 6. Initialize Data Collator and Trainer
-    data_collator = Qwen35VisionDataCollator(processor=processor)
+    data_collator = Qwen35OnTheFlyCollator(processor=processor, strategy=strategy_name)
 
     trainer_instance = Trainer(
         model=lora_model_instance,
         args=training_args_instance,
-        train_dataset=tokenized_train,
-        eval_dataset=tokenized_val,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"],
         data_collator=data_collator,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)],
     )
