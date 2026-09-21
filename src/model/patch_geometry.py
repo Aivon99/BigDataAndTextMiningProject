@@ -27,9 +27,15 @@ VERIFIED against the real checkpoint ("Qwen/Qwen3.5-0.8B") via `tests.ipynb`:
   method; `get_vision_token_pitch`/`check_alignment`'s arithmetic is now only
   a rough fallback for when no processor is loaded yet.
 
-For the record: at image_size=512, board_squares=8, this checkpoint gives a
-clean 4 vision-tokens-per-square (32x32 grid) -- 512 is aligned, confirmed by
-`tests.ipynb`. No dataset regeneration needed.
+CORRECTION -- the token grid is only half of alignment. At image_size=512 this
+checkpoint gives a 32x32 token grid (4 tokens per square *if the board fills
+the whole image*). The first datasets did NOT: `chess.svg.board` draws a/h and
+1-8 coordinate labels by default, which shrinks the board into a ~20px margin
+(squares ~59px, not 64px), so both the ViT patches and the 64px tiles shuffled
+by `apply_patch_permutation` straddled two squares. Rendering now passes
+`coordinates=False` (see `data.generation.render_board_svg`), so the 8x8 squares
+fill the image exactly; `check_board_fills_image()` below verifies that from
+actual pixels and should be run on any dataset before trusting alignment.
 """
 
 from typing import Optional
@@ -131,6 +137,49 @@ def check_alignment(
         )
 
     return result
+
+
+# python-chess default square colours (#ffce9e / #d18b47 in current releases,
+# confirmed from the rendered dataset images -- older releases used a
+# different palette, so re-check if the `chess` version changes).
+_LIGHT_RGB = (255, 206, 158)
+_DARK_RGB = (209, 139, 71)
+
+
+def check_board_fills_image(
+    image,
+    board_squares: int = BOARD_SQUARES_PER_SIDE,
+    inset: int = 3,
+    tolerance: int = 12,
+    min_fraction: float = 0.8,
+) -> dict:
+    """
+    Pixel-level check that the 8x8 squares tile the image edge to edge (no
+    coordinate labels / border margin). Samples just inside the top-left
+    corner of every square and compares it with the expected light/dark
+    colour for that square's parity. Pieces and last-move highlights can
+    spoil a few samples, hence the `min_fraction` threshold rather than 100%.
+    A margin of even ~20px shifts every square boundary and fails this check.
+    """
+    rgb = image.convert("RGB")
+    size = rgb.size[0]
+    square_px = size / board_squares
+    matches = 0
+    for row in range(board_squares):
+        for col in range(board_squares):
+            x = int(col * square_px) + inset
+            y = int(row * square_px) + inset
+            expected = _LIGHT_RGB if (row + col) % 2 == 0 else _DARK_RGB
+            got = rgb.getpixel((x, y))
+            if all(abs(g - e) <= tolerance for g, e in zip(got, expected)):
+                matches += 1
+    fraction = matches / (board_squares * board_squares)
+    fills = fraction >= min_fraction
+    print(
+        f"[patch_geometry] (pixels) {matches}/{board_squares * board_squares} square corners "
+        f"match the expected colours -> board {'fills' if fills else 'does NOT fill'} the image."
+    )
+    return {"match_fraction": fraction, "board_fills_image": fills}
 
 
 def measure_alignment_empirically(

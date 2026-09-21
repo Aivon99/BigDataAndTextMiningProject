@@ -2,6 +2,7 @@ import Levenshtein
 import chess
 import numpy as np
 import pandas as pd
+import re
 from pathlib import Path
 from PIL import Image
 import torch
@@ -122,6 +123,24 @@ class Qwen35OnTheFlyCollator(Qwen35VisionDataCollator):
         return super().__call__(processed)
 
 
+_FEN_RE = re.compile(
+    r"(?:[pnbrqkPNBRQK1-8]+/){7}[pnbrqkPNBRQK1-8]+"
+    r"(?: +[wb] +(?:-|[KQkq]+) +(?:-|[a-h][36]) +[0-9]+ +[0-9]+)?"
+)
+
+
+def extract_fen(text: str) -> str:
+    """
+    Pulls the first FEN-shaped string out of a model reply (board part plus, if
+    present, the side/castling/en-passant/clock fields). A chatty answer like
+    "The FEN is r3k2r/... w KQkq - 1 13." is scored on the FEN it contains
+    instead of on all the surrounding words; if nothing FEN-shaped is found the
+    stripped reply is returned unchanged, so garbage is still scored as garbage.
+    """
+    match = _FEN_RE.search(text)
+    return match.group(0).strip() if match else text.strip()
+
+
 def calculate_fen_exact_match(predicted_fen: str, ground_truth_fen: str) -> float:
     """
     Calculates FEN Exact Match: returns 1.0 if the predicted FEN string 
@@ -217,17 +236,21 @@ def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name
             return_tensors="pt"
         ).to(model.device)
 
-        # 5. Generate the prediction
+        # 5. Generate the prediction. A FEN is at most ~90 characters and a token
+        # is never shorter than one character, so 100 new tokens can't cut off a
+        # correct answer; fine-tuned models stop earlier on their own (EOS).
         with torch.no_grad():
-            output_token_ids = model.generate(**model_inputs, max_new_tokens=128)
+            output_token_ids = model.generate(**model_inputs, max_new_tokens=100)
 
         # 6. Trim prompt tokens from the generated output
         trimmed_output_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, output_token_ids)
         ]
-        predicted_fen_string = processor.batch_decode(
+        raw_output = processor.batch_decode(
             trimmed_output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].strip()
+        # Score the FEN inside a chatty reply rather than the whole reply
+        predicted_fen_string = extract_fen(raw_output)
 
         # 7. Compute metrics for the current sample using predefined functions
         exact_match = calculate_fen_exact_match(predicted_fen_string, ground_truth_fen)
@@ -239,6 +262,7 @@ def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name
             "sample_id": sample_id,
             "ground_truth": ground_truth_fen,
             "predicted": predicted_fen_string,
+            "raw_output": raw_output,
             "fen_exact_match": exact_match,
             "levenshtein_distance": levenshtein_res["levenshtein_distance"],
             "character_error_rate": levenshtein_res["character_error_rate"],

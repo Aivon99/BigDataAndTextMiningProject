@@ -5,3 +5,4 @@ external/
 dataset_task1/
 dataset_task2/
 dataset_task3/
+.render_stamps/

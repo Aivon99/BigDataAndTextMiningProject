@@ -48,8 +48,14 @@ def render_board_svg(
     size: int = 512,
     lastmove: Optional[chess.Move] = None,
 ) -> Image.Image:
-    """Renders a chess.Board state to an RGB PIL Image via SVG rasterization."""
-    svg_data = chess.svg.board(board=board, size=size, lastmove=lastmove)
+    """Renders a chess.Board state to an RGB PIL Image via SVG rasterization.
+
+    coordinates=False on purpose: with python-chess's default labels the board
+    sits inside a ~20px margin, so squares are ~59px instead of size/8 and no
+    longer line up with the ViT patch grid or the 8x8 tiles used for patch
+    reordering. Without labels the 8x8 squares fill the image exactly.
+    """
+    svg_data = chess.svg.board(board=board, size=size, lastmove=lastmove, coordinates=False)
     png_bytes = cairosvg.svg2png(bytestring=svg_data.encode("utf-8"))
     return Image.open(io.BytesIO(png_bytes)).convert("RGB")
 
@@ -257,6 +263,16 @@ def _render_sample_to_disk(args: tuple) -> dict:
     return result["metadata"]
 
 
+# Bump whenever the rendered images change (e.g. board coordinates removed) so
+# `skip_existing` doesn't keep stale images that only *look* up to date.
+RENDER_VERSION = "no-coordinates-v2"
+
+
+def _stamp_path(output_root: Path, task: str, split_name: str) -> Path:
+    # Kept outside dataset_<task>/ so the stamp never gets uploaded to the Hub.
+    return output_root / ".render_stamps" / f"{task}_{split_name}"
+
+
 def _existing_sample_count(output_dir: Path) -> int:
     """
     Number of samples already recorded in `output_dir/metadata.jsonl`, or 0
@@ -303,12 +319,19 @@ def generate_datasets_parallel(
             output_dir = output_root / f"dataset_{task}" / split_name
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            if skip_existing and _existing_sample_count(output_dir) == len(split_df):
+            stamp = _stamp_path(output_root, task, split_name)
+            stamp_ok = stamp.exists() and stamp.read_text().strip() == RENDER_VERSION
+            if skip_existing and stamp_ok and _existing_sample_count(output_dir) == len(split_df):
                 print(
                     f"[{task}/{split_name}] already has {len(split_df)} sample(s) "
-                    f"matching the requested split size — skipping."
+                    f"rendered with '{RENDER_VERSION}' — skipping."
                 )
                 continue
+            if skip_existing and _existing_sample_count(output_dir) == len(split_df):
+                print(
+                    f"[{task}/{split_name}] has {len(split_df)} sample(s) from an older render "
+                    f"version — re-rendering."
+                )
 
             for idx, (_, row) in enumerate(split_df.iterrows()):
                 sample_id = f"sample_{idx:06d}"
@@ -359,5 +382,12 @@ def generate_datasets_parallel(
         with open(metadata_path, "w", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    for task, splits in task_splits.items():
+        for split_name in splits:
+            if output_root / f"dataset_{task}" / split_name in records_by_dir:
+                stamp = _stamp_path(output_root, task, split_name)
+                stamp.parent.mkdir(parents=True, exist_ok=True)
+                stamp.write_text(RENDER_VERSION)
 
     print("All task/split datasets generated.")
