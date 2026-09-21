@@ -40,6 +40,10 @@ def find_resumable_checkpoint(repo_id: str) -> str | None:
         )
         candidate = Path(local_dir) / "last-checkpoint"
         if candidate.exists() and any(candidate.iterdir()):
+            # Checkpoints saved by an earlier fp16 run include a gradient-scaler
+            # state; training now uses bf16 (no scaler), so Trainer would crash
+            # trying to load it. Drop the local copy (the Hub file is untouched).
+            (candidate / "scaler.pt").unlink(missing_ok=True)
             print(f"Found a resumable checkpoint on the Hub for '{repo_id}': {candidate}")
             return str(candidate)
     except Exception as e:
