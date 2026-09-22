@@ -198,11 +198,18 @@ def calculate_san_exact_match(predicted_move: str, ground_truth_move: str) -> in
     """
     return 1 if predicted_move.strip() == ground_truth_move.strip() else 0
 
-def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name: str) -> pd.DataFrame:
+def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name: str, generate_kwargs: dict | None = None) -> pd.DataFrame:
     """
-    Evaluates a given VLM model (vanilla or fine-tuned) on the chessboard Task 1 dataset 
+    Evaluates a given VLM model (vanilla or fine-tuned) on the chessboard Task 1 dataset
     and returns a DataFrame containing predictions, metrics, and aggregate results.
+
+    `generate_kwargs` overrides/extends the default `model.generate(...)` call (which
+    otherwise runs greedy decoding with max_new_tokens=100) -- e.g.
+    `{"num_beams": 4, "early_stopping": True}` for beam search. Left as {} everywhere
+    except the beam-search experiment notebook, so existing greedy-decoding results
+    stay reproducible.
     """
+    generate_kwargs = {"max_new_tokens": 100, **(generate_kwargs or {})}
     model.eval()
     results_list = []
 
@@ -240,7 +247,7 @@ def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name
         # is never shorter than one character, so 100 new tokens can't cut off a
         # correct answer; fine-tuned models stop earlier on their own (EOS).
         with torch.no_grad():
-            output_token_ids = model.generate(**model_inputs, max_new_tokens=100)
+            output_token_ids = model.generate(**model_inputs, **generate_kwargs)
 
         # 6. Trim prompt tokens from the generated output
         trimmed_output_ids = [
