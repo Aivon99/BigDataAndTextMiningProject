@@ -30,17 +30,33 @@ single sample per forward pass (mirrors this project's existing
 no gradient accumulation, single-GPU, no mixed-precision scaler. Treat this
 as a starting point to profile and iterate on, not a finished, tuned
 training pipeline.
+
+Checkpointing: since this doesn't use `Trainer`, it has none of
+`hub_strategy="checkpoint"`'s built-in resumability -- an interrupted run
+used to lose everything back to epoch 0, step 0. `train_with_learned_reordering`
+now saves a checkpoint (LoRA adapter, policy weights + running baseline,
+both optimizers, the LR scheduler, and the current epoch/step) to the Hub
+every `checkpoint_every_steps` steps and at the end of every epoch, and
+resumes from it automatically if one exists -- mirroring the granularity of
+`find_resumable_checkpoint`'s per-epoch Trainer checkpoints, but finer
+(step-level, since one epoch here can take much longer than in the
+`Trainer`-based cells).
 """
 
+import json
 from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from peft import get_peft_model
+from huggingface_hub import HfApi, snapshot_download
+from peft import get_peft_model, set_peft_model_state_dict
+from peft.utils import load_peft_weights
 from transformers import get_linear_schedule_with_warmup
 
 from eval.utilities import apply_patch_permutation, preprocess_function
+
+_CHECKPOINT_SUBDIR = "last-learned-checkpoint"
 
 
 def _sample_gumbel(shape, device, eps=1e-8):
@@ -112,6 +128,78 @@ class PlackettLucePatchPolicy(nn.Module):
         return -(advantage * log_prob).mean()
 
 
+def _save_learned_reordering_checkpoint(
+    local_dir: Path,
+    repo_id: str,
+    lora_model,
+    policy: "PlackettLucePatchPolicy",
+    model_optimizer,
+    policy_optimizer,
+    scheduler,
+    epoch: int,
+    step_in_epoch: int,
+    global_step: int,
+) -> None:
+    """
+    Saves everything needed to resume mid-run (adapter weights, policy state
+    -- including its running REINFORCE baseline, both optimizers, the LR
+    scheduler, and the exact epoch/step) locally, then pushes it to
+    `repo_id` on the Hub under `last-learned-checkpoint/`. Overwrites the
+    previous checkpoint each time -- only the latest is ever needed.
+    """
+    ckpt_dir = local_dir / _CHECKPOINT_SUBDIR
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    lora_model.save_pretrained(str(ckpt_dir))
+    torch.save(policy.state_dict(), ckpt_dir / "policy.pt")
+    torch.save(model_optimizer.state_dict(), ckpt_dir / "model_optimizer.pt")
+    torch.save(policy_optimizer.state_dict(), ckpt_dir / "policy_optimizer.pt")
+    torch.save(scheduler.state_dict(), ckpt_dir / "scheduler.pt")
+    metadata = {"epoch": epoch, "step_in_epoch": step_in_epoch, "global_step": global_step}
+    (ckpt_dir / "metadata.json").write_text(json.dumps(metadata))
+
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+    api.upload_folder(
+        repo_id=repo_id,
+        repo_type="model",
+        folder_path=str(ckpt_dir),
+        path_in_repo=_CHECKPOINT_SUBDIR,
+        commit_message=f"Learned-reordering checkpoint: epoch {epoch}, step {step_in_epoch} (global step {global_step})",
+    )
+
+
+def find_resumable_learned_reordering_checkpoint(repo_id: str) -> Optional[Tuple[Path, dict]]:
+    """
+    Mirrors `eval.utilities.find_resumable_checkpoint`, but for the
+    `last-learned-checkpoint/` folder this module's own checkpointing writes
+    (a `transformers.Trainer` checkpoint and this one are not interchangeable
+    -- different files, different loading code). Returns
+    (local_checkpoint_dir, metadata_dict) or None if there's nothing to
+    resume, so training starts fresh.
+    """
+    try:
+        api = HfApi()
+        if not api.repo_exists(repo_id=repo_id, repo_type="model"):
+            return None
+
+        local_dir = snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            allow_patterns=f"{_CHECKPOINT_SUBDIR}/*",
+        )
+        candidate = Path(local_dir) / _CHECKPOINT_SUBDIR
+        metadata_path = candidate / "metadata.json"
+        if candidate.exists() and metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text())
+            print(f"Found a resumable learned-reordering checkpoint on the Hub for '{repo_id}': {candidate}")
+            return candidate, metadata
+    except Exception as e:
+        print(f"No resumable learned-reordering checkpoint found for '{repo_id}' ({e}); starting fresh.")
+
+    return None
+
+
 def train_with_learned_reordering(
     dataset,
     processor,
@@ -127,6 +215,7 @@ def train_with_learned_reordering(
     policy_weight: float = 1.0,
     log_every: int = 10,
     output_dir: str = "./learned_reordering_output",
+    checkpoint_every_steps: int = 200,
 ):
     """
     Jointly trains LoRA adapters on `model` and a `PlackettLucePatchPolicy`
@@ -140,10 +229,21 @@ def train_with_learned_reordering(
     both `image` and `image_t1`, mirroring how `finetune_and_push_chessboard_model`
     reorders both frames of a dual-image sample with the same fixed strategy.
 
+    Resumable: a checkpoint is pushed to `{hf_org_prefix}/qwen-{task}-learned-
+    reordering-lora` every `checkpoint_every_steps` steps and at the end of
+    every epoch. If that repo already has one (e.g. a previous call to this
+    function was interrupted), training picks up from the exact epoch/step it
+    left off at instead of restarting from scratch. The dataset is iterated
+    in a fixed, unshuffled order (`train_split` as given), which is what
+    makes resuming to the same position deterministic and correct.
+
     Returns (lora_model, policy, repo_id_target).
     """
     if task not in ("task1", "task2", "task3"):
         raise ValueError(f"train_with_learned_reordering: unknown task '{task}'")
+
+    repo_id_target = f"{hf_org_prefix}/qwen-{task}-learned-reordering-lora"
+    resume = find_resumable_learned_reordering_checkpoint(repo_id_target)
 
     device = model.device
     lora_model = get_peft_model(model, peft_config)
@@ -160,15 +260,41 @@ def train_with_learned_reordering(
         model_optimizer, num_warmup_steps=0, num_training_steps=num_steps
     )
 
+    start_epoch = 0
+    start_step_in_epoch = 0
+    global_step = 0
+    if resume is not None:
+        ckpt_dir, metadata = resume
+        set_peft_model_state_dict(lora_model, load_peft_weights(str(ckpt_dir)))
+        policy.load_state_dict(torch.load(ckpt_dir / "policy.pt", map_location=device))
+        model_optimizer.load_state_dict(torch.load(ckpt_dir / "model_optimizer.pt", map_location=device))
+        policy_optimizer.load_state_dict(torch.load(ckpt_dir / "policy_optimizer.pt", map_location=device))
+        scheduler.load_state_dict(torch.load(ckpt_dir / "scheduler.pt", map_location=device))
+        start_epoch = metadata["epoch"]
+        start_step_in_epoch = metadata["step_in_epoch"]
+        global_step = metadata["global_step"]
+        print(
+            f"Resuming learned-reordering training for {task} from epoch {start_epoch}, "
+            f"step {start_step_in_epoch} (global step {global_step})..."
+        )
+    else:
+        print(f"No resumable learned-reordering checkpoint found for {task}; starting fresh.")
+
+    local_output_dir = Path(output_dir)
+
     # These fields carry a real leading batch dimension already (as produced by
     # `processor(..., return_tensors="pt")` for a batch of 1) and must NOT be
     # unsqueezed again; only the plain-sequence fields do. Mirrors the
     # distinction `Qwen35VisionDataCollator` makes (cat vs pad_sequence).
     NO_UNSQUEEZE_KEYS = {"pixel_values", "image_grid_thw"}
 
-    global_step = 0
-    for epoch in range(num_train_epochs):
-        for row in train_split:
+    for epoch in range(start_epoch, num_train_epochs):
+        epoch_start_offset = start_step_in_epoch if epoch == start_epoch else 0
+        rows = (
+            train_split.select(range(epoch_start_offset, len(train_split)))
+            if epoch_start_offset else train_split
+        )
+        for row_idx, row in enumerate(rows, start=epoch_start_offset):
             permutation, log_prob = policy.sample(batch_size=1)
             perm_list = permutation[0].tolist()
 
@@ -221,7 +347,24 @@ def train_with_learned_reordering(
                     f"baseline={policy.running_baseline.item():.4f}"
                 )
 
-    repo_id_target = f"{hf_org_prefix}/qwen-{task}-learned-reordering-lora"
+            if global_step % checkpoint_every_steps == 0:
+                _save_learned_reordering_checkpoint(
+                    local_output_dir, repo_id_target, lora_model, policy,
+                    model_optimizer, policy_optimizer, scheduler,
+                    epoch=epoch, step_in_epoch=row_idx + 1, global_step=global_step,
+                )
+                print(f"[{task}] checkpoint saved at epoch {epoch}, step {row_idx + 1} (global step {global_step}).")
+
+        # End-of-epoch checkpoint too, so a disconnect right after an epoch
+        # boundary (but before the next step_in_epoch%checkpoint_every_steps
+        # hit) still resumes at the epoch it actually reached.
+        _save_learned_reordering_checkpoint(
+            local_output_dir, repo_id_target, lora_model, policy,
+            model_optimizer, policy_optimizer, scheduler,
+            epoch=epoch + 1, step_in_epoch=0, global_step=global_step,
+        )
+        print(f"[{task}] checkpoint saved at end of epoch {epoch} (global step {global_step}).")
+
     print(f"Pushing learned-reordering model and processor to Hugging Face Hub: {repo_id_target}...")
     lora_model.push_to_hub(
         repo_id_target,
