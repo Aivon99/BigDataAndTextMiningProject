@@ -342,9 +342,18 @@ def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name
         trimmed_output_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, output_token_ids)
         ]
-        predicted_move = processor.batch_decode(
+        raw_output = processor.batch_decode(
             trimmed_output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].strip()
+        # No SAN-move extraction yet (unlike Task 1's extract_fen): a bare
+        # square coordinate like "c1" is itself valid SAN, so a naive
+        # first-match regex risks pulling an unrelated square mentioned in
+        # the model's reasoning rather than its actual answer. predicted ==
+        # raw_output for now; raw_output is still kept as its own column so
+        # a chatty vs. clean-but-wrong failure mode can be told apart later
+        # (needed for the spec's qualitative error analysis) without
+        # re-running inference.
+        predicted_move = raw_output
 
         # 7. Compute metrics for the current sample
         exact_match = calculate_san_exact_match(predicted_move, ground_truth_move)
@@ -354,6 +363,7 @@ def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name
             "sample_id": sample_id,
             "ground_truth": ground_truth_move,
             "predicted": predicted_move,
+            "raw_output": raw_output,
             "exact_match": exact_match
         })
 
@@ -429,9 +439,12 @@ def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name
         trimmed_output_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, output_token_ids)
         ]
-        predicted_move_string = processor.batch_decode(
+        raw_output = processor.batch_decode(
             trimmed_output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].strip()
+        # See the matching comment in evaluate_chessboard_model_task_2 --
+        # no SAN-move extraction here yet, same false-positive risk applies.
+        predicted_move_string = raw_output
 
         # 7. Compute Exact Match (EM) metric using the predefined function
         exact_match = calculate_san_exact_match(predicted_move_string, ground_truth_move)
@@ -441,6 +454,7 @@ def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name
             "sample_id": sample_id,
             "ground_truth": ground_truth_move,
             "predicted": predicted_move_string,
+            "raw_output": raw_output,
             "exact_match": exact_match
         })
 
@@ -516,8 +530,8 @@ def preprocess_function(sample, processor):
 
     # Genera la stringa tramite il template nativo
     text = processor.apply_chat_template(
-        chat_messages, 
-        tokenize=False, 
+        chat_messages,
+        tokenize=False,
         add_generation_prompt=False
     )
 
@@ -542,8 +556,34 @@ def preprocess_function(sample, processor):
     if "image_grid_thw" in batch:
         result["image_grid_thw"] = batch["image_grid_thw"]
 
-    # Configura i labels per il Causal LM
+    # Labels for the Causal LM: loss must cover ONLY the assistant's reply,
+    # not the prompt (instructions + images + question). Without this mask
+    # -- the previous behaviour -- the model also gets gradient on copying
+    # back its own prompt, which it already predicts almost perfectly under
+    # teacher forcing; for short targets like SAN moves (Task 2/3, a handful
+    # of tokens) this dilutes the useful signal in the reported average loss
+    # to near-invisibility (prompt+images vastly outnumber the target in
+    # token count), making the training loss hard to read and likely
+    # slowing learning on the part that actually matters. The prompt/reply
+    # boundary is found via the literal "<|im_start|>assistant\n" marker in
+    # the same string already tokenized above -- not a fresh
+    # apply_chat_template(..., add_generation_prompt=True) call, which for
+    # Qwen3.5 in non-thinking mode would also insert a
+    # "<think>\n\n</think>\n\n" block that isn't present in the real
+    # sequence, throwing off the token count.
+    assistant_marker = "<|im_start|>assistant\n"
+    marker_pos = text.index(assistant_marker)
+    prompt_only_text = text[: marker_pos + len(assistant_marker)]
+    prompt_batch = processor(
+        text=[prompt_only_text],
+        images=images_input,
+        padding=False,
+        return_tensors="pt",
+    )
+    prompt_len = prompt_batch["input_ids"].shape[1]
+
     labels = result["input_ids"].clone()
+    labels[:prompt_len] = -100
     if processor.tokenizer.pad_token_id is not None:
         labels[labels == processor.tokenizer.pad_token_id] = -100
     result["labels"] = labels
