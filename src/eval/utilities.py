@@ -13,10 +13,11 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, snapshot_download, hf_hub_download
 from peft import get_peft_model
 from functools import partial
 from torch.utils.data import DataLoader
+from datasets import load_dataset, Dataset
 
 
 def find_resumable_checkpoint(repo_id: str) -> str | None:
@@ -478,6 +479,129 @@ def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name
     ])
 
     return results_df, model_summary_df
+
+
+_EVAL_FUNCS = {
+    "task1": evaluate_chessboard_model_task_1,
+    "task2": evaluate_chessboard_model_task_2,
+    "task3": evaluate_chessboard_model_task_3,
+}
+
+
+def _eval_results_repo_id(task: str, hf_org_prefix: str) -> str:
+    return f"{hf_org_prefix}/evaluation-results-{task}"
+
+
+def load_or_init_results_table(task: str, hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
+    """
+    Loads the running model-comparison table for `task` from the Hub (the
+    same `{hf_org_prefix}/evaluation-results-{task}` dataset the notebooks
+    already push to at the end), or returns an empty DataFrame if nothing's
+    been pushed yet.
+
+    Call this once, early, to initialise `all_models_results` -- instead of
+    `all_models_results = <first model's summary_df>`, which silently
+    discards everything already computed in a previous session the moment
+    it runs. With this, running any evaluation cell (in any order, in a
+    fresh session or not) always appends to what's already known rather
+    than starting over or crashing with a NameError.
+    """
+    repo_id = _eval_results_repo_id(task, hf_org_prefix)
+    try:
+        table = load_dataset(repo_id, split="train").to_pandas()
+        print(f"Loaded existing comparison table for {task} from '{repo_id}' ({len(table)} model(s) already evaluated).")
+        return table
+    except Exception:
+        print(f"No existing comparison table found for {task} on the Hub (or repo doesn't exist yet) -- starting fresh.")
+        return pd.DataFrame()
+
+
+def append_or_replace(all_results: pd.DataFrame, summary_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Appends `summary_df` (one model's comparison row) to `all_results`,
+    replacing any existing row for the same `model_name` instead of
+    duplicating it. Needed because `all_results` may already contain a row
+    for this model (loaded from the Hub via `load_or_init_results_table` or
+    `evaluate_with_cache`'s own cache hit) -- a plain `pd.concat` would
+    otherwise leave two rows for the same model in the comparison table.
+    """
+    if "model_name" in all_results.columns and len(summary_df) > 0:
+        model_name = summary_df["model_name"].iloc[0]
+        all_results = all_results[all_results["model_name"] != model_name]
+    return pd.concat([all_results, summary_df], ignore_index=True)
+
+
+def evaluate_with_cache(
+    task: str,
+    model,
+    processor,
+    dataset_split,
+    model_name: str,
+    hf_org_prefix: str = "bdatm-project",
+    force: bool = False,
+):
+    """
+    Drop-in replacement for `evaluate_chessboard_model_task_{1,2,3}` (same
+    return shape: `(results_df, summary_df)`) that checks
+    `{hf_org_prefix}/evaluation-results-{task}` on the Hub first. If a row
+    for this exact `model_name` is already there, returns it directly --
+    no model.generate() calls, no GPU time -- instead of re-running
+    inference that can take tens of minutes. Otherwise runs the real
+    evaluation and pushes both the summary row (upserted into the shared
+    comparison table) and the per-sample results (as their own CSV, so
+    qualitative error analysis survives a session restart too) to the Hub,
+    so the *next* run/session hits the cache instead.
+
+    Pass `force=True` to bypass the cache and re-evaluate anyway (e.g.
+    after a metric or prompt change makes the cached numbers stale).
+    """
+    if task not in _EVAL_FUNCS:
+        raise ValueError(f"evaluate_with_cache: unknown task '{task}'")
+
+    repo_id = _eval_results_repo_id(task, hf_org_prefix)
+    slug = model_name.lower().replace(" ", "_")
+
+    if not force:
+        try:
+            table = load_dataset(repo_id, split="train").to_pandas()
+            match = table[table["model_name"] == model_name]
+            if len(match) > 0:
+                print(f"[{task}] Using cached evaluation for '{model_name}' -- skipping inference.")
+                summary_df = match.reset_index(drop=True)
+                try:
+                    sample_path = hf_hub_download(repo_id, f"per_sample/{slug}.csv", repo_type="dataset")
+                    results_df = pd.read_csv(sample_path)
+                except Exception:
+                    results_df = None  # summary is cached but the per-sample file isn't (e.g. an older cache entry)
+                return results_df, summary_df
+        except Exception:
+            pass  # repo/table doesn't exist yet, or nothing cached for this model -- fall through to a real eval
+
+    results_df, summary_df = _EVAL_FUNCS[task](
+        model=model, processor=processor, dataset_split=dataset_split, model_name=model_name
+    )
+
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
+    api.upload_file(
+        path_or_fileobj=results_df.to_csv(index=False).encode("utf-8"),
+        path_in_repo=f"per_sample/{slug}.csv",
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=f"Cache per-sample results for '{model_name}' ({task})",
+    )
+
+    try:
+        existing = load_dataset(repo_id, split="train").to_pandas()
+        existing = existing[existing["model_name"] != model_name]
+        updated = pd.concat([existing, summary_df], ignore_index=True)
+    except Exception:
+        updated = summary_df
+    Dataset.from_pandas(updated, preserve_index=False).push_to_hub(repo_id)
+    print(f"[{task}] Cached evaluation for '{model_name}' -- pushed to '{repo_id}'.")
+
+    return results_df, summary_df
+
 
 def preprocess_function(sample, processor):
     task = sample.get("task", "task1")
