@@ -18,5 +18,5 @@ dataset_generation:
   # automatically down to whatever's actually available for the scarcer
   # side — see clamp_balanced_turn_counts() in src/data/utilities.py.
   n_per_turn: 2000
-
+  
   image_size: 512

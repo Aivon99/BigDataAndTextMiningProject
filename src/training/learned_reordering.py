@@ -54,9 +54,18 @@ from peft import get_peft_model, set_peft_model_state_dict
 from peft.utils import load_peft_weights
 from transformers import get_linear_schedule_with_warmup
 
-from eval.utilities import apply_patch_permutation, preprocess_function
+from eval.utilities import TRAINING_RECIPE, apply_patch_permutation, preprocess_function
 
 _CHECKPOINT_SUBDIR = "last-learned-checkpoint"
+
+# Default logit gap between consecutive raster positions at init (see
+# PlackettLucePatchPolicy). Part of the checkpoint recipe: a checkpoint
+# trained with a different init/recipe is not resumed.
+DEFAULT_INIT_SPACING = 2.0
+
+
+def _learned_recipe(init_spacing: float) -> str:
+    return f"{TRAINING_RECIPE}+pl-init-spacing-{init_spacing:g}"
 
 
 def _sample_gumbel(shape, device, eps=1e-8):
@@ -68,19 +77,28 @@ class PlackettLucePatchPolicy(nn.Module):
     """
     Learns a soft ranking over the grid_size x grid_size chessboard patches.
 
-    Holds one learnable logit per patch position (initialized close to
-    raster order, so training starts from a sane baseline rather than a
-    random permutation). `sample()` draws a permutation via Gumbel-top-k
-    sampling from the induced Plackett-Luce distribution, and returns both
-    the permutation and its log-probability (needed for the REINFORCE loss).
+    Holds one learnable logit per patch position, initialized to raster
+    order with a gap of `init_spacing` between consecutive positions.
+    `sample()` draws a permutation via Gumbel-top-k sampling from the
+    induced Plackett-Luce distribution, and returns both the permutation
+    and its log-probability (needed for the REINFORCE loss).
+
+    The gap matters: two positions swap with probability ~1/(1+e^gap)
+    under Gumbel noise. The first version used linspace(0, -1) -- a gap of
+    1/63, i.e. every sampled permutation was an essentially uniform random
+    shuffle of the 64 tiles. LoRA was then trained on scrambled boards (the
+    Task 2 learned model: 8% move accuracy vs 95% for raster) and the
+    "learned" greedy order was noise. A gap of 2.0 gives ~12% adjacent
+    swaps and rare long-range ones: exploration around raster, which the
+    policy can then move away from if the reward says so.
     """
 
-    def __init__(self, grid_size: int = 8, baseline_momentum: float = 0.9):
+    def __init__(self, grid_size: int = 8, baseline_momentum: float = 0.9, init_spacing: float = DEFAULT_INIT_SPACING):
         super().__init__()
         num_patches = grid_size * grid_size
         self.grid_size = grid_size
         self.num_patches = num_patches
-        self.logits = nn.Parameter(torch.linspace(0, -1, num_patches))
+        self.logits = nn.Parameter(-init_spacing * torch.arange(num_patches, dtype=torch.float32))
         self.register_buffer("running_baseline", torch.tensor(0.0))
         self.baseline_momentum = baseline_momentum
         self.temperature = 1.0
@@ -139,6 +157,7 @@ def _save_learned_reordering_checkpoint(
     epoch: int,
     step_in_epoch: int,
     global_step: int,
+    recipe: str,
 ) -> None:
     """
     Saves everything needed to resume mid-run (adapter weights, policy state
@@ -155,7 +174,7 @@ def _save_learned_reordering_checkpoint(
     torch.save(model_optimizer.state_dict(), ckpt_dir / "model_optimizer.pt")
     torch.save(policy_optimizer.state_dict(), ckpt_dir / "policy_optimizer.pt")
     torch.save(scheduler.state_dict(), ckpt_dir / "scheduler.pt")
-    metadata = {"epoch": epoch, "step_in_epoch": step_in_epoch, "global_step": global_step}
+    metadata = {"epoch": epoch, "step_in_epoch": step_in_epoch, "global_step": global_step, "recipe": recipe}
     (ckpt_dir / "metadata.json").write_text(json.dumps(metadata))
 
     api = HfApi()
@@ -169,7 +188,7 @@ def _save_learned_reordering_checkpoint(
     )
 
 
-def find_resumable_learned_reordering_checkpoint(repo_id: str) -> Optional[Tuple[Path, dict]]:
+def find_resumable_learned_reordering_checkpoint(repo_id: str, recipe: Optional[str] = None) -> Optional[Tuple[Path, dict]]:
     """
     Mirrors `eval.utilities.find_resumable_checkpoint`, but for the
     `last-learned-checkpoint/` folder this module's own checkpointing writes
@@ -192,6 +211,12 @@ def find_resumable_learned_reordering_checkpoint(repo_id: str) -> Optional[Tuple
         metadata_path = candidate / "metadata.json"
         if candidate.exists() and metadata_path.exists():
             metadata = json.loads(metadata_path.read_text())
+            if recipe is not None and metadata.get("recipe") != recipe:
+                print(
+                    f"Ignoring the learned-reordering checkpoint in '{repo_id}': recipe "
+                    f"{metadata.get('recipe')!r} != current {recipe!r}. Starting fresh."
+                )
+                return None
             print(f"Found a resumable learned-reordering checkpoint on the Hub for '{repo_id}': {candidate}")
             return candidate, metadata
     except Exception as e:
@@ -216,6 +241,7 @@ def train_with_learned_reordering(
     log_every: int = 10,
     output_dir: str = "./learned_reordering_output",
     checkpoint_every_steps: int = 200,
+    init_spacing: float = DEFAULT_INIT_SPACING,
 ):
     """
     Jointly trains LoRA adapters on `model` and a `PlackettLucePatchPolicy`
@@ -243,13 +269,14 @@ def train_with_learned_reordering(
         raise ValueError(f"train_with_learned_reordering: unknown task '{task}'")
 
     repo_id_target = f"{hf_org_prefix}/qwen-{task}-learned-reordering-lora"
-    resume = find_resumable_learned_reordering_checkpoint(repo_id_target)
+    recipe = _learned_recipe(init_spacing)
+    resume = find_resumable_learned_reordering_checkpoint(repo_id_target, recipe=recipe)
 
     device = model.device
     lora_model = get_peft_model(model, peft_config)
     lora_model.train()
 
-    policy = PlackettLucePatchPolicy(grid_size=grid_size).to(device)
+    policy = PlackettLucePatchPolicy(grid_size=grid_size, init_spacing=init_spacing).to(device)
 
     model_optimizer = torch.optim.AdamW(lora_model.parameters(), lr=learning_rate)
     policy_optimizer = torch.optim.Adam(policy.parameters(), lr=policy_learning_rate)
@@ -351,7 +378,7 @@ def train_with_learned_reordering(
                 _save_learned_reordering_checkpoint(
                     local_output_dir, repo_id_target, lora_model, policy,
                     model_optimizer, policy_optimizer, scheduler,
-                    epoch=epoch, step_in_epoch=row_idx + 1, global_step=global_step,
+                    epoch=epoch, step_in_epoch=row_idx + 1, global_step=global_step, recipe=recipe,
                 )
                 print(f"[{task}] checkpoint saved at epoch {epoch}, step {row_idx + 1} (global step {global_step}).")
 
@@ -361,7 +388,7 @@ def train_with_learned_reordering(
         _save_learned_reordering_checkpoint(
             local_output_dir, repo_id_target, lora_model, policy,
             model_optimizer, policy_optimizer, scheduler,
-            epoch=epoch + 1, step_in_epoch=0, global_step=global_step,
+            epoch=epoch + 1, step_in_epoch=0, global_step=global_step, recipe=recipe,
         )
         print(f"[{task}] checkpoint saved at end of epoch {epoch} (global step {global_step}).")
 

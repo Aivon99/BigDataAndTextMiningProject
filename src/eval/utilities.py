@@ -1,3 +1,4 @@
+import json
 import Levenshtein
 import chess
 import numpy as np
@@ -19,6 +20,46 @@ from functools import partial
 from torch.utils.data import DataLoader
 from datasets import load_dataset, Dataset
 
+from eval.diagnostics import SAN_DIAGNOSTIC_COLUMNS, analyze_san_predictions
+
+
+# Identifies the training objective the current code implements. Bump it
+# whenever preprocess_function / the collators / the loss change in a way
+# that makes an older checkpoint's weights (or its eval_loss history)
+# incomparable with a fresh run. find_resumable_checkpoint refuses to resume
+# a run stamped with a different recipe (or none at all).
+#
+# Why this exists: every Task 3 run was started before the prompt-masking fix
+# (commit 9df1c7d, loss over the whole sequence) and resumed after it (loss
+# over the answer only). eval_loss jumped 2.76 -> 0.75 at the resume point,
+# early stopping / best-checkpoint selection compared incomparable numbers,
+# and only the last 2-6 epochs trained on the real objective -- Task 3 then
+# scored ~0% for every model. Task 1 was trained entirely before the fix.
+TRAINING_RECIPE = "answer-only-loss-v1"
+_RECIPE_FILE = "training_recipe.json"
+
+
+def read_training_recipe(repo_id: str) -> str | None:
+    """The recipe a Hub model repo was trained with, or None if it isn't stamped."""
+    try:
+        path = hf_hub_download(repo_id, _RECIPE_FILE, repo_type="model")
+        return json.loads(Path(path).read_text()).get("recipe")
+    except Exception:
+        return None
+
+
+def stamp_training_recipe(repo_id: str, recipe: str = TRAINING_RECIPE) -> None:
+    """Records `recipe` on the Hub repo (creating it if needed) so a later resume can check it."""
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+    api.upload_file(
+        path_or_fileobj=json.dumps({"recipe": recipe}).encode("utf-8"),
+        path_in_repo=_RECIPE_FILE,
+        repo_id=repo_id,
+        repo_type="model",
+        commit_message=f"Training recipe: {recipe}",
+    )
+
 
 def find_resumable_checkpoint(repo_id: str) -> str | None:
     """
@@ -29,10 +70,33 @@ def find_resumable_checkpoint(repo_id: str) -> str | None:
     pick training back up after an interruption (e.g. a Colab disconnect
     wiping the local runtime) instead of starting over from epoch 0.
     Returns None if there's nothing to resume from, so training starts fresh.
+
+    Only resumes a checkpoint stamped with the current TRAINING_RECIPE; an
+    unstamped or differently-stamped one is ignored (training restarts from
+    scratch and overwrites it). Whenever training is about to start fresh,
+    the repo is stamped with the current recipe.
     """
     try:
         api = HfApi()
         if not api.repo_exists(repo_id=repo_id, repo_type="model"):
+            stamp_training_recipe(repo_id)
+            return None
+
+        recipe = read_training_recipe(repo_id)
+        if recipe != TRAINING_RECIPE:
+            print(
+                f"Ignoring the checkpoint in '{repo_id}': it was trained with recipe {recipe!r}, "
+                f"the current code uses {TRAINING_RECIPE!r}. Starting fresh."
+            )
+            # Drop the stale checkpoint before stamping: otherwise a disconnect
+            # before the first new epoch is saved would leave a correctly-stamped
+            # repo still holding the old checkpoint, and the next run would resume it.
+            if any(f.startswith("last-checkpoint/") for f in api.list_repo_files(repo_id, repo_type="model")):
+                api.delete_folder(
+                    "last-checkpoint", repo_id=repo_id, repo_type="model",
+                    commit_message=f"Remove checkpoint trained with recipe {recipe!r}",
+                )
+            stamp_training_recipe(repo_id)
             return None
 
         local_dir = snapshot_download(
@@ -368,9 +432,10 @@ def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name
             "exact_match": exact_match
         })
 
-    # Convert results into a Pandas DataFrame
-    results_df = pd.DataFrame(results_list)
-    
+    # Convert results into a Pandas DataFrame, with move-level diagnostics
+    # (legal / same move / from-to squares, see eval/diagnostics.py)
+    results_df = analyze_san_predictions(pd.DataFrame(results_list), dataset_split["fen"])
+
     # Save sample-level results to CSV
     csv_filename = f"task2_{model_name.lower().replace(' ', '_')}_results.csv"
     results_df.to_csv(csv_filename, index=False)
@@ -383,7 +448,8 @@ def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name
     model_summary_df = pd.DataFrame([
         {
             "model_name": model_name,
-            "exact_match": mean_em
+            "exact_match": mean_em,
+            **{col: results_df[col].mean() for col in SAN_DIAGNOSTIC_COLUMNS},
         }
     ])
 
@@ -434,7 +500,8 @@ def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name
 
         # 5. Generate the prediction
         with torch.no_grad():
-            output_token_ids = model.generate(**model_inputs, max_new_tokens=128)
+            # SAN answers are a few tokens; same budget as Task 2
+            output_token_ids = model.generate(**model_inputs, max_new_tokens=16)
 
         # 6. Trim prompt tokens from the generated output
         trimmed_output_ids = [
@@ -459,9 +526,10 @@ def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name
             "exact_match": exact_match
         })
 
-    # Convert results into a Pandas DataFrame
-    results_df = pd.DataFrame(results_list)
-    
+    # Convert results into a Pandas DataFrame, with move-level diagnostics
+    # (legal / same move / from-to squares, see eval/diagnostics.py)
+    results_df = analyze_san_predictions(pd.DataFrame(results_list), dataset_split["fen"])
+
     # Save sample-level results to CSV
     csv_filename = f"task3_{model_name.lower().replace(' ', '_')}_results.csv"
     results_df.to_csv(csv_filename, index=False)
@@ -474,7 +542,8 @@ def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name
     model_summary_df = pd.DataFrame([
         {
             "model_name": model_name,
-            "exact_match": mean_em
+            "exact_match": mean_em,
+            **{col: results_df[col].mean() for col in SAN_DIAGNOSTIC_COLUMNS},
         }
     ])
 
@@ -539,6 +608,7 @@ def evaluate_with_cache(
     model_name: str,
     hf_org_prefix: str = "bdatm-project",
     force: bool = False,
+    adapter_repo_id: str | None = None,
 ):
     """
     Drop-in replacement for `evaluate_chessboard_model_task_{1,2,3}` (same
@@ -554,17 +624,32 @@ def evaluate_with_cache(
 
     Pass `force=True` to bypass the cache and re-evaluate anyway (e.g.
     after a metric or prompt change makes the cached numbers stale).
+
+    Pass `adapter_repo_id` (the Hub repo the evaluated LoRA weights come
+    from) to tie the cache entry to that repo's current commit: the row
+    stores `adapter_sha`, and a cached row is only reused while the repo is
+    still at that commit. Without it, retraining a model under the same
+    `model_name` would keep serving the old model's cached numbers.
     """
     if task not in _EVAL_FUNCS:
         raise ValueError(f"evaluate_with_cache: unknown task '{task}'")
 
     repo_id = _eval_results_repo_id(task, hf_org_prefix)
     slug = model_name.lower().replace(" ", "_")
+    adapter_sha = HfApi().model_info(adapter_repo_id).sha if adapter_repo_id else None
 
     if not force:
         try:
             table = load_dataset(repo_id, split="train").to_pandas()
             match = table[table["model_name"] == model_name]
+            if adapter_sha is not None and len(match) > 0:
+                cached_sha = match["adapter_sha"].iloc[0] if "adapter_sha" in match.columns else None
+                if cached_sha != adapter_sha:
+                    print(
+                        f"[{task}] Cached evaluation for '{model_name}' is for adapter commit "
+                        f"{cached_sha!r}, but '{adapter_repo_id}' is now at {adapter_sha[:8]} -- re-evaluating."
+                    )
+                    match = match.iloc[0:0]
             if len(match) > 0:
                 print(f"[{task}] Using cached evaluation for '{model_name}' -- skipping inference.")
                 summary_df = match.reset_index(drop=True)
@@ -580,6 +665,8 @@ def evaluate_with_cache(
     results_df, summary_df = _EVAL_FUNCS[task](
         model=model, processor=processor, dataset_split=dataset_split, model_name=model_name
     )
+    if adapter_sha is not None:
+        summary_df["adapter_sha"] = adapter_sha
 
     api = HfApi()
     api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
