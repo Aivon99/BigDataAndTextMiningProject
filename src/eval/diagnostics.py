@@ -93,6 +93,9 @@ def analyze_san_predictions(results_df: pd.DataFrame, fens: Iterable[str]) -> pd
       from_sq_match / to_sq_match / piece_match -- partial credit, legal moves only
     """
     df = results_df.copy().reset_index(drop=True)
+    # Re-analysing a CSV that already has these columns (any evaluation since
+    # they were added) must replace them, not duplicate them.
+    df = df.drop(columns=[c for c in ["pred_san", *SAN_DIAGNOSTIC_COLUMNS] if c in df.columns])
     fens = list(fens)
     if len(fens) != len(df):
         raise ValueError(f"analyze_san_predictions: {len(fens)} FENs for {len(df)} results")
@@ -158,6 +161,89 @@ def san_error_breakdown(analyzed_df: pd.DataFrame) -> pd.Series:
     return analyzed_df.apply(bucket, axis=1).value_counts()
 
 
+# ---------------------------------------------------------------------------
+# Task 1: FEN field-level analysis
+# ---------------------------------------------------------------------------
+
+FEN_DIAGNOSTIC_COLUMNS = [
+    "board_exact_match", "board_character_error_rate",
+    "side_to_move_match", "castling_match", "en_passant_match", "clocks_match",
+]
+
+
+def _levenshtein(a: str, b: str) -> int:
+    try:
+        import Levenshtein
+        return Levenshtein.distance(a, b)
+    except ImportError:  # small pure-python fallback, FEN strings are short
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+            prev = cur
+        return prev[-1]
+
+
+def analyze_fen_predictions(results_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds per-field columns to a Task 1 per-sample results frame.
+
+    A FEN has six fields, and only the first is fully visible in the image:
+    the board is always drawn from White's side with no turn marker, and the
+    halfmove clock / fullmove number can't be seen at all. Full-FEN exact
+    match therefore measures guessing as much as perception (Task 1 after
+    retraining: 98.8% of boards exactly right, 0.8% full-FEN exact match;
+    the model outputs halfmove "0" for 99% of samples). The board fields are
+    the perception metric; the others are reported separately.
+
+      board_exact_match           -- piece placement (field 1) identical
+      board_character_error_rate  -- CER on field 1 only
+      side_to_move_match / castling_match / en_passant_match -- fields 2-4
+      clocks_match                -- fields 5-6 (halfmove, fullmove) both right
+    """
+    df = results_df.copy().reset_index(drop=True)
+    df = df.drop(columns=[c for c in FEN_DIAGNOSTIC_COLUMNS if c in df.columns])
+    rows = []
+    for gt, pred in zip(df["ground_truth"].fillna("").astype(str), df["predicted"].fillna("").astype(str)):
+        g, p = gt.split(), pred.split()
+        field = lambda f, i: f[i] if len(f) > i else ""
+        g_board, p_board = field(g, 0), field(p, 0)
+        rows.append({
+            "board_exact_match": int(g_board == p_board and g_board != ""),
+            "board_character_error_rate": _levenshtein(p_board, g_board) / max(len(g_board), 1),
+            "side_to_move_match": int(field(g, 1) == field(p, 1)),
+            "castling_match": int(field(g, 2) == field(p, 2)),
+            "en_passant_match": int(field(g, 3) == field(p, 3)),
+            "clocks_match": int(field(g, 4) == field(p, 4) and field(g, 5) == field(p, 5)),
+        })
+    return pd.concat([df, pd.DataFrame(rows)], axis=1)
+
+
+def rescore_cached_fen_results(hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
+    """
+    Task 1 counterpart of `rescore_cached_san_results`: per-field FEN metrics
+    for every per-sample CSV cached on the Hub, no GPU. One row per model,
+    best `board_exact_match` first.
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    repo_id = f"{hf_org_prefix}/evaluation-results-task1"
+    files = [f for f in HfApi().list_repo_files(repo_id, repo_type="dataset")
+             if f.startswith("per_sample/") and f.endswith(".csv")]
+    rows = []
+    for f in files:
+        df = analyze_fen_predictions(pd.read_csv(hf_hub_download(repo_id, f, repo_type="dataset"), keep_default_na=False))
+        summary = {"model_name": f[len("per_sample/"):-4]}
+        for col in ["fen_exact_match", "square_by_square_accuracy", "character_error_rate", *FEN_DIAGNOSTIC_COLUMNS]:
+            if col in df.columns:
+                summary[col] = df[col].mean()
+        rows.append(summary)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("board_exact_match", ascending=False).reset_index(drop=True)
+
+
 def rescore_cached_san_results(task: str, fens: Iterable[str], hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
     """
     Re-scores every per-sample CSV cached under
@@ -193,24 +279,39 @@ def training_health_report(repo_id: str, jump_threshold: float = 0.4, verbose: b
     training-recipe marker matching the current code
     (`eval.utilities.TRAINING_RECIPE`).
 
-    Flags any epoch-to-epoch eval-loss change larger than `jump_threshold`
-    (relative) *after the first epoch*. A healthy run moves smoothly; a
-    sudden step (Task 3: 2.76 -> 0.75 in one epoch, at a different epoch in
-    every run) means the loss itself was redefined partway through -- e.g.
-    a code change picked up on resume -- so "best checkpoint" selection and
-    early stopping across that point compared incomparable numbers.
+    Flags an epoch-to-epoch eval-loss change larger than `jump_threshold`
+    (relative) that comes right after a plateau (previous change < 10%).
+    Healthy runs drop steeply in the first epochs and then flatten; a step
+    *after* flattening (Task 3: 2.76 -> 0.75 in one epoch, at a different
+    epoch in every run) means the loss itself was redefined partway through
+    -- e.g. a code change picked up on resume -- so best-checkpoint
+    selection and early stopping across that point compared incomparable
+    numbers.
+
+    Also reports the best vs the last evaluated epoch, and whether the best
+    epoch's adapter is on the Hub (`best-checkpoint/`, written by
+    HubBestAdapterCallback): a run resumed in a new session before that
+    callback existed published its last epoch, not its best.
+
+    Learned-reordering repos (custom loop, no Trainer state) report their
+    checkpoint metadata and recipe instead.
     """
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import HfApi, hf_hub_download
 
     report = {"repo_id": repo_id, "problems": []}
-    try:
-        path = hf_hub_download(repo_id, "last-checkpoint/trainer_state.json")
-        state = json.loads(Path(path).read_text())
-    except Exception as e:
-        report["problems"].append(f"no trainer_state.json on the Hub ({type(e).__name__})")
+    files = HfApi().list_repo_files(repo_id, repo_type="model")
+    if "last-checkpoint/trainer_state.json" not in files:
+        if "last-learned-checkpoint/metadata.json" in files:
+            meta = json.loads(Path(hf_hub_download(repo_id, "last-learned-checkpoint/metadata.json")).read_text())
+            report.update({"learned_checkpoint": meta, "recipe": meta.get("recipe")})
+            if verbose:
+                print(f"=== {repo_id} === (learned-reordering loop, no Trainer state)\n  checkpoint metadata: {meta}")
+            return report
+        report["problems"].append("no trainer_state.json on the Hub")
         if verbose:
-            print(f"[{repo_id}] {report['problems'][-1]}")
+            print(f"=== {repo_id} ===\n  - {report['problems'][-1]}")
         return report
+    state = json.loads(Path(hf_hub_download(repo_id, "last-checkpoint/trainer_state.json")).read_text())
 
     evals = [(round(h["epoch"], 2), h["eval_loss"]) for h in state["log_history"] if "eval_loss" in h]
     trains = [(round(h["epoch"], 2), h["loss"]) for h in state["log_history"] if "loss" in h]
@@ -222,11 +323,24 @@ def training_health_report(repo_id: str, jump_threshold: float = 0.4, verbose: b
         "global_step": state.get("global_step"),
     })
 
-    for (e0, l0), (e1, l1) in zip(evals, evals[1:]):
-        if l0 > 0 and abs(l1 - l0) / l0 > jump_threshold:
+    rel = [abs(l1 - l0) / l0 if l0 > 0 else 0.0 for (_, l0), (_, l1) in zip(evals, evals[1:])]
+    for i in range(1, len(rel)):
+        if rel[i] > jump_threshold and rel[i - 1] < 0.10:
+            (e0, l0), (e1, l1) = evals[i], evals[i + 1]
             report["problems"].append(
-                f"eval_loss jumps {l0:.3f} -> {l1:.3f} between epoch {e0} and {e1}: "
+                f"eval_loss jumps {l0:.3f} -> {l1:.3f} between epoch {e0} and {e1} after a plateau: "
                 "the loss definition probably changed mid-run (resumed across a code change)"
+            )
+
+    if evals:
+        best_epoch, best_loss = min(evals, key=lambda x: x[1])
+        last_epoch, last_loss = evals[-1]
+        report.update({"best_epoch": best_epoch, "last_epoch": last_epoch})
+        if best_epoch != last_epoch and not any(f.startswith("best-checkpoint/") for f in files):
+            report["problems"].append(
+                f"best epoch {best_epoch:g} (eval_loss {best_loss:.4f}) != last epoch {last_epoch:g} ({last_loss:.4f}) "
+                "and no best-checkpoint/ on the Hub: if this run was resumed in a new session, the published "
+                "adapter is the last epoch's, not the best"
             )
 
     try:

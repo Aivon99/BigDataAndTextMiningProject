@@ -15,13 +15,23 @@ from transformers import (
     TrainingArguments,
 )
 from huggingface_hub import HfApi, snapshot_download, hf_hub_download
+try:
+    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
+except ImportError:  # older huggingface_hub
+    from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
+from transformers import TrainerCallback
 from peft import get_peft_model, set_peft_model_state_dict
 from peft.utils import load_peft_weights
 from functools import partial
 from torch.utils.data import DataLoader
 from datasets import load_dataset, Dataset
 
-from eval.diagnostics import SAN_DIAGNOSTIC_COLUMNS, analyze_san_predictions
+from eval.diagnostics import (
+    FEN_DIAGNOSTIC_COLUMNS,
+    SAN_DIAGNOSTIC_COLUMNS,
+    analyze_fen_predictions,
+    analyze_san_predictions,
+)
 
 
 # Identifies the training objective the current code implements. Bump it
@@ -41,12 +51,18 @@ _RECIPE_FILE = "training_recipe.json"
 
 
 def read_training_recipe(repo_id: str) -> str | None:
-    """The recipe a Hub model repo was trained with, or None if it isn't stamped."""
+    """
+    The recipe a Hub model repo was trained with, or None if the repo or its
+    recipe file doesn't exist. Any other error (network, auth, rate limit)
+    is raised: a None here makes find_resumable_checkpoint delete the
+    checkpoint and retrain from scratch, which must never happen just
+    because the Hub was briefly unreachable.
+    """
     try:
         path = hf_hub_download(repo_id, _RECIPE_FILE, repo_type="model")
-        return json.loads(Path(path).read_text()).get("recipe")
-    except Exception:
+    except (EntryNotFoundError, RepositoryNotFoundError):
         return None
+    return json.loads(Path(path).read_text()).get("recipe")
 
 
 def stamp_training_recipe(repo_id: str, recipe: str = TRAINING_RECIPE) -> None:
@@ -62,60 +78,67 @@ def stamp_training_recipe(repo_id: str, recipe: str = TRAINING_RECIPE) -> None:
     )
 
 
+# Hub folders holding training state for a run in progress: the resumable
+# Trainer checkpoint, and the best epoch's adapter (HubBestAdapterCallback).
+_RUN_STATE_FOLDERS = ("last-checkpoint", "best-checkpoint")
+
+
 def find_resumable_checkpoint(repo_id: str) -> str | None:
     """
     If `repo_id` already exists on the Hub and has a `last-checkpoint/`
     folder (written by a previous `Trainer` run with
     `hub_strategy="checkpoint"`), download it and return its local path —
-    pass that straight to `Trainer.train(resume_from_checkpoint=...)` to
-    pick training back up after an interruption (e.g. a Colab disconnect
-    wiping the local runtime) instead of starting over from epoch 0.
-    Returns None if there's nothing to resume from, so training starts fresh.
+    pass that straight to `Trainer.train(resume_from_checkpoint=...)` (or
+    `train_or_load_finished`) to pick training back up after an
+    interruption (e.g. a Colab disconnect wiping the local runtime) instead
+    of starting over from epoch 0. Returns None if there's nothing to
+    resume from, so training starts fresh.
 
     Only resumes a checkpoint stamped with the current TRAINING_RECIPE; an
-    unstamped or differently-stamped one is ignored (training restarts from
-    scratch and overwrites it). Whenever training is about to start fresh,
-    the repo is stamped with the current recipe.
+    unstamped or differently-stamped run's state is deleted from the Hub
+    and training restarts from scratch. Whenever training is about to start
+    fresh, the repo is stamped with the current recipe.
+
+    Hub errors are raised rather than treated as "nothing to resume": a
+    silent fresh start would retrain for hours and overwrite the checkpoint.
     """
-    try:
-        api = HfApi()
-        if not api.repo_exists(repo_id=repo_id, repo_type="model"):
-            stamp_training_recipe(repo_id)
-            return None
+    api = HfApi()
+    if not api.repo_exists(repo_id=repo_id, repo_type="model"):
+        stamp_training_recipe(repo_id)
+        return None
 
-        recipe = read_training_recipe(repo_id)
-        if recipe != TRAINING_RECIPE:
-            print(
-                f"Ignoring the checkpoint in '{repo_id}': it was trained with recipe {recipe!r}, "
-                f"the current code uses {TRAINING_RECIPE!r}. Starting fresh."
-            )
-            # Drop the stale checkpoint before stamping: otherwise a disconnect
-            # before the first new epoch is saved would leave a correctly-stamped
-            # repo still holding the old checkpoint, and the next run would resume it.
-            if any(f.startswith("last-checkpoint/") for f in api.list_repo_files(repo_id, repo_type="model")):
-                api.delete_folder(
-                    "last-checkpoint", repo_id=repo_id, repo_type="model",
-                    commit_message=f"Remove checkpoint trained with recipe {recipe!r}",
-                )
-            stamp_training_recipe(repo_id)
-            return None
-
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            repo_type="model",
-            allow_patterns="last-checkpoint/*",
+    recipe = read_training_recipe(repo_id)
+    if recipe != TRAINING_RECIPE:
+        print(
+            f"Ignoring the checkpoint in '{repo_id}': it was trained with recipe {recipe!r}, "
+            f"the current code uses {TRAINING_RECIPE!r}. Starting fresh."
         )
-        candidate = Path(local_dir) / "last-checkpoint"
-        if candidate.exists() and any(candidate.iterdir()):
-            # Checkpoints saved by an earlier fp16 run include a gradient-scaler
-            # state; training now uses bf16 (no scaler), so Trainer would crash
-            # trying to load it. Drop the local copy (the Hub file is untouched).
-            (candidate / "scaler.pt").unlink(missing_ok=True)
-            print(f"Found a resumable checkpoint on the Hub for '{repo_id}': {candidate}")
-            return str(candidate)
-    except Exception as e:
-        print(f"No resumable checkpoint found for '{repo_id}' ({e}); starting fresh.")
+        # Drop the stale run state before stamping: otherwise a disconnect
+        # before the first new epoch is saved would leave a correctly-stamped
+        # repo still holding the old checkpoint, and the next run would resume it.
+        files = api.list_repo_files(repo_id, repo_type="model")
+        for folder in _RUN_STATE_FOLDERS:
+            if any(f.startswith(folder + "/") for f in files):
+                api.delete_folder(
+                    folder, repo_id=repo_id, repo_type="model",
+                    commit_message=f"Remove {folder} trained with recipe {recipe!r}",
+                )
+        stamp_training_recipe(repo_id)
+        return None
 
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        repo_type="model",
+        allow_patterns="last-checkpoint/*",
+    )
+    candidate = Path(local_dir) / "last-checkpoint"
+    if candidate.exists() and any(candidate.iterdir()):
+        # Checkpoints saved by an earlier fp16 run include a gradient-scaler
+        # state; training now uses bf16 (no scaler), so Trainer would crash
+        # trying to load it. Drop the local copy (the Hub file is untouched).
+        (candidate / "scaler.pt").unlink(missing_ok=True)
+        print(f"Found a resumable checkpoint on the Hub for '{repo_id}': {candidate}")
+        return str(candidate)
     return None
 
 
@@ -130,25 +153,91 @@ def training_is_complete(checkpoint_dir: str) -> bool:
     return bool(control.get("should_training_stop")) or state["global_step"] >= state["max_steps"]
 
 
-def train_or_load_finished(trainer, repo_id: str, resume_checkpoint: str | None):
+def train_or_load_finished(trainer, repo_id: str, resume_checkpoint: str | None) -> bool:
     """
     `trainer.train(resume_from_checkpoint=...)`, except when the Hub run in
     `repo_id` already finished: then the final adapter pushed to the repo
-    root is loaded into `trainer.model` and training is skipped.
+    root is loaded into `trainer.model` and training is skipped. Returns
+    True if training ran, False if it was skipped (nothing new to push).
 
     Needed because resuming a finished run is not a no-op: Trainer resets
     `should_training_stop` in on_train_begin, so a run that early-stopped at
-    epoch 9/10 trains epoch 10 again; and the best checkpoint it recorded
-    lives on the old runtime's disk, so load_best_model_at_end silently
-    keeps the last epoch. The re-push would then replace the best weights
-    and change the adapter's Hub commit, invalidating every cached
-    evaluation keyed to it (see evaluate_with_cache's adapter_repo_id).
+    epoch 9/10 trains epoch 10 again, and the re-push would replace the
+    published weights (invalidating every cached evaluation of them).
     """
     if resume_checkpoint and training_is_complete(resume_checkpoint):
         print(f"Training for '{repo_id}' already finished on the Hub -- skipping training and loading its final adapter.")
         set_peft_model_state_dict(trainer.model, load_peft_weights(repo_id))
-        return None
-    return trainer.train(resume_from_checkpoint=resume_checkpoint)
+        return False
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
+    return True
+
+
+class HubBestAdapterCallback(TrainerCallback):
+    """
+    Keeps the best epoch's LoRA adapter on the Hub (`best-checkpoint/`), so
+    `load_best_model_at_end` still works when a run is resumed in a new
+    Colab session.
+
+    Trainer only knows the best checkpoint by its local path
+    (`./<output_dir>/checkpoint-N`); hub_strategy="checkpoint" pushes only the
+    latest checkpoint. After a resume in a fresh runtime that path is gone,
+    Trainer logs "The best checkpoint ... does not exist anymore. Ignoring
+    it" and ends with the LAST epoch's weights -- which is what happened to
+    the Task 1 raster run (published epoch 9, eval_loss 0.119, instead of
+    the best epoch, 0.110).
+
+    on_save: when the checkpoint just written is the new best, upload its
+    adapter + a best.json (step, metric, recipe) to `best-checkpoint/`.
+    on_train_end: if Trainer could not restore the best model locally,
+    load it from `best-checkpoint/` -- only if best.json matches this run's
+    best_metric and recipe, so a stale upload is never used.
+    """
+
+    _FOLDER = "best-checkpoint"
+
+    def __init__(self, repo_id: str):
+        self.repo_id = repo_id
+
+    def on_save(self, args, state, control, **kwargs):
+        best = state.best_model_checkpoint
+        if not best or Path(best).name != f"checkpoint-{state.global_step}" or not Path(best).is_dir():
+            return
+        from huggingface_hub import CommitOperationAdd
+
+        ops = [
+            CommitOperationAdd(f"{self._FOLDER}/{name}", str(Path(best) / name))
+            for name in ("adapter_model.safetensors", "adapter_config.json")
+            if (Path(best) / name).exists()
+        ]
+        if not ops:
+            return
+        meta = {"global_step": state.global_step, "best_metric": state.best_metric, "recipe": TRAINING_RECIPE}
+        ops.append(CommitOperationAdd(f"{self._FOLDER}/best.json", json.dumps(meta).encode("utf-8")))
+        HfApi().create_commit(
+            repo_id=self.repo_id, repo_type="model", operations=ops,
+            commit_message=f"Best adapter so far: step {state.global_step} ({args.metric_for_best_model}={state.best_metric:.4f})",
+        )
+
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        if not args.load_best_model_at_end or state.best_metric is None or model is None:
+            return
+        local_best = state.best_model_checkpoint
+        if local_best and Path(local_best).is_dir():
+            return  # Trainer already restored it from disk
+        try:
+            meta_path = hf_hub_download(self.repo_id, f"{self._FOLDER}/best.json", repo_type="model")
+        except EntryNotFoundError:
+            print(f"[best-checkpoint] No best adapter on the Hub for '{self.repo_id}'; keeping the last epoch's weights.")
+            return
+        meta = json.loads(Path(meta_path).read_text())
+        if meta.get("recipe") != TRAINING_RECIPE or abs(meta["best_metric"] - state.best_metric) > 1e-6:
+            print(f"[best-checkpoint] Hub best adapter {meta} doesn't match this run's best_metric "
+                  f"{state.best_metric}; keeping the last epoch's weights.")
+            return
+        set_peft_model_state_dict(model, load_peft_weights(self.repo_id, subfolder=self._FOLDER))
+        print(f"[best-checkpoint] Restored the best adapter (step {meta['global_step']}, "
+              f"{args.metric_for_best_model}={meta['best_metric']:.4f}) from the Hub.")
 
 
 class Qwen35VisionDataCollator:
@@ -368,8 +457,9 @@ def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name
             "square_by_square_accuracy": square_accuracy
         })
 
-    # Convert results into a Pandas DataFrame
-    results_df = pd.DataFrame(results_list)
+    # Convert results into a Pandas DataFrame, with per-field FEN columns
+    # (board vs side-to-move/castling/en-passant/clocks, see eval/diagnostics.py)
+    results_df = analyze_fen_predictions(pd.DataFrame(results_list))
     
     # Save sample-level results to CSV
     csv_filename = f"task1_{model_name.lower().replace(' ', '_')}_results.csv"
@@ -389,7 +479,8 @@ def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name
             "fen_exact_match": mean_fen_em,
             "character_error_rate": mean_cer,
             "square_by_square_accuracy": mean_square_acc,
-            "levenshtein_distance": mean_levenshtein
+            "levenshtein_distance": mean_levenshtein,
+            **{col: results_df[col].mean() for col in FEN_DIAGNOSTIC_COLUMNS},
         }
     ])
 
@@ -702,6 +793,46 @@ def append_or_replace(all_results: pd.DataFrame, summary_df: pd.DataFrame) -> pd
     return pd.concat([all_results, summary_df], ignore_index=True)
 
 
+_ADAPTER_WEIGHTS = "adapter_model.safetensors"
+
+
+def adapter_fingerprint(repo_id: str, revision: str | None = None) -> str:
+    """
+    sha256 of the LoRA weights file in `repo_id` (at `revision`, default the
+    latest commit), read from the Hub's file metadata -- nothing is downloaded.
+
+    Used as the evaluation-cache key instead of the repo's commit sha: the
+    commit changes on every push to the repo (model-card or processor
+    re-uploads, which also differ whenever Colab installs newer library
+    versions; checkpoint pushes; the recipe stamp), none of which change
+    the weights being evaluated.
+    """
+    info = HfApi().model_info(repo_id, revision=revision, files_metadata=True)
+    for sibling in info.siblings:
+        if sibling.rfilename == _ADAPTER_WEIGHTS and sibling.lfs is not None:
+            lfs = sibling.lfs
+            return lfs["sha256"] if isinstance(lfs, dict) else lfs.sha256
+    raise FileNotFoundError(f"No {_ADAPTER_WEIGHTS} in '{repo_id}' at revision {revision or 'main'}")
+
+
+def _cached_adapter_matches(cached, adapter_repo_id: str, current_fingerprint: str) -> bool:
+    """
+    Whether a cached row's `adapter_sha` refers to the weights currently in
+    `adapter_repo_id`. Rows written since the fingerprint change store the
+    weights' sha256 directly; older rows stored the repo commit sha, which is
+    resolved to the weights fingerprint at that commit -- so those cached
+    evaluations stay valid as long as the weights haven't changed.
+    """
+    if not isinstance(cached, str) or not cached:
+        return False
+    if cached == current_fingerprint:
+        return True
+    try:
+        return adapter_fingerprint(adapter_repo_id, revision=cached) == current_fingerprint
+    except (RepositoryNotFoundError, RevisionNotFoundError, EntryNotFoundError, FileNotFoundError):
+        return False
+
+
 def evaluate_with_cache(
     task: str,
     model,
@@ -728,17 +859,18 @@ def evaluate_with_cache(
     after a metric or prompt change makes the cached numbers stale).
 
     Pass `adapter_repo_id` (the Hub repo the evaluated LoRA weights come
-    from) to tie the cache entry to that repo's current commit: the row
-    stores `adapter_sha`, and a cached row is only reused while the repo is
-    still at that commit. Without it, retraining a model under the same
-    `model_name` would keep serving the old model's cached numbers.
+    from) to tie the cache entry to those weights: the row stores
+    `adapter_sha` (see `adapter_fingerprint`), and a cached row is only
+    reused while the repo still holds the same weights. Without it,
+    retraining a model under the same `model_name` would keep serving the
+    old model's cached numbers.
     """
     if task not in _EVAL_FUNCS:
         raise ValueError(f"evaluate_with_cache: unknown task '{task}'")
 
     repo_id = _eval_results_repo_id(task, hf_org_prefix)
     slug = model_name.lower().replace(" ", "_")
-    adapter_sha = HfApi().model_info(adapter_repo_id).sha if adapter_repo_id else None
+    adapter_sha = adapter_fingerprint(adapter_repo_id) if adapter_repo_id else None
 
     if not force:
         # Read errors propagate on purpose: swallowing them used to turn a
@@ -748,10 +880,10 @@ def evaluate_with_cache(
             match = table[table["model_name"] == model_name]
             if adapter_sha is not None and len(match) > 0:
                 cached_sha = match["adapter_sha"].iloc[0] if "adapter_sha" in match.columns else None
-                if cached_sha != adapter_sha:
+                if not _cached_adapter_matches(cached_sha, adapter_repo_id, adapter_sha):
                     print(
-                        f"[{task}] Cached evaluation for '{model_name}' is for adapter commit "
-                        f"{cached_sha!r}, but '{adapter_repo_id}' is now at {adapter_sha[:8]} -- re-evaluating."
+                        f"[{task}] Cached evaluation for '{model_name}' was for different weights than "
+                        f"those now in '{adapter_repo_id}' -- re-evaluating."
                     )
                     match = match.iloc[0:0]
             if len(match) > 0:
@@ -1072,7 +1204,10 @@ def finetune_and_push_chessboard_model(
         train_dataset=dataset["train"],
         eval_dataset=dataset["validation"],
         data_collator=data_collator,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)],
+        callbacks=[
+            EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
+            HubBestAdapterCallback(repo_id_target),
+        ],
     )
 
     # 7. Train (or resume) the model
@@ -1080,7 +1215,9 @@ def finetune_and_push_chessboard_model(
         print(f"Resuming training for {task} ({strategy_name} reordering) from {resume_checkpoint}...")
     else:
         print(f"Training model for {task} with {strategy_name} reordering...")
-    train_or_load_finished(trainer_instance, repo_id_target, resume_checkpoint)
+    if not train_or_load_finished(trainer_instance, repo_id_target, resume_checkpoint):
+        print(f"Nothing new to push for {repo_id_target}.")
+        return trainer_instance.model
 
     # 8. Push final weights and processor directly to Hugging Face Hub
     print(
