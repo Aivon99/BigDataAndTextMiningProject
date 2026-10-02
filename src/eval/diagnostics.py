@@ -74,6 +74,34 @@ def _parse(board: chess.Board, san: str) -> Optional[chess.Move]:
         return None
 
 
+_SAN_PARTS_RE = re.compile(r"^([KQRBN])?([a-h])?([1-8])?x?([a-h][1-8])(?:=?([QRBN]))?[+#]?$")
+_PIECES = {"K": chess.KING, "Q": chess.QUEEN, "R": chess.ROOK, "B": chess.BISHOP, "N": chess.KNIGHT}
+
+
+def _ambiguous_candidates(board: chess.Board, san: str) -> list:
+    """
+    Legal moves an under-disambiguated SAN could mean ("Rc8" when both rooks
+    can reach c8). python-chess refuses to parse such SAN; the model,
+    though, has identified piece and destination -- and in Task 2 the
+    origin square is highlighted -- so it's a notation slip, not a wrong move.
+    """
+    m = _SAN_PARTS_RE.match(san)
+    if not m:
+        return []
+    piece, from_file, from_rank, dest, promo = m.groups()
+    piece_type = _PIECES[piece] if piece else chess.PAWN
+    to_sq = chess.parse_square(dest)
+    promotion = _PIECES[promo] if promo else None
+    return [
+        mv for mv in board.legal_moves
+        if mv.to_square == to_sq
+        and board.piece_type_at(mv.from_square) == piece_type
+        and mv.promotion == promotion
+        and (from_file is None or chess.square_file(mv.from_square) == "abcdefgh".index(from_file))
+        and (from_rank is None or chess.square_rank(mv.from_square) == int(from_rank) - 1)
+    ]
+
+
 def analyze_san_predictions(results_df: pd.DataFrame, fens: Iterable[str]) -> pd.DataFrame:
     """
     Adds move-level diagnostic columns to a Task 2/3 per-sample results frame.
@@ -87,10 +115,17 @@ def analyze_san_predictions(results_df: pd.DataFrame, fens: Iterable[str]) -> pd
       pred_san        -- `extract_san(raw_output)`
       em_extracted    -- exact match after extraction (fixes chatty/repeating output)
       multiline       -- the model kept generating after its answer
-      legal           -- pred_san is a legal move in the position
+      legal           -- pred_san denotes a legal move in the position (an
+                         under-disambiguated SAN counts if some legal move fits it)
+      ambiguous       -- pred_san is under-disambiguated ("Rc8" with two rooks able to go)
       same_move       -- pred_san is the ground-truth move, however it was written
-                         (e.g. "Be4" for "Bxe4", "Nf5" for "Nf5+", "Re8" for "Rge8")
+                         (e.g. "Be4" for "Bxe4", "Nf5" for "Nf5+", "Rc8" for "Rac8"
+                         -- ambiguous SAN counts if the true move is one of its readings)
       from_sq_match / to_sq_match / piece_match -- partial credit, legal moves only
+
+    Most strict-EM misses of the fine-tuned Task 2 model are notation, not
+    perception: a missing/extra capture "x" (the post-move image doesn't show
+    whether a piece was taken), a missing "+", or missing disambiguation.
     """
     df = results_df.copy().reset_index(drop=True)
     # Re-analysing a CSV that already has these columns (any evaluation since
@@ -107,12 +142,20 @@ def analyze_san_predictions(results_df: pd.DataFrame, fens: Iterable[str]) -> pd
         pred = extract_san(raw)
         gt_move = _parse(board, gt)
         pred_move = _parse(board, pred)
+        ambiguous = False
+        if pred_move is None:
+            candidates = _ambiguous_candidates(board, pred)
+            if len(candidates) > 1:
+                ambiguous = True
+                # credit the true move if it's one of the readings, else any reading
+                pred_move = gt_move if gt_move in candidates else candidates[0]
         legal = pred_move is not None
         rows.append({
             "pred_san": pred,
             "em_extracted": int(pred == gt.strip()),
             "multiline": int("\n" in raw.strip()),
             "legal": int(legal),
+            "ambiguous": int(ambiguous),
             "same_move": int(legal and gt_move is not None and pred_move == gt_move),
             "from_sq_match": int(legal and gt_move is not None and pred_move.from_square == gt_move.from_square),
             "to_sq_match": int(legal and gt_move is not None and pred_move.to_square == gt_move.to_square),
@@ -125,7 +168,7 @@ def analyze_san_predictions(results_df: pd.DataFrame, fens: Iterable[str]) -> pd
 
 
 SAN_DIAGNOSTIC_COLUMNS = [
-    "em_extracted", "same_move", "legal", "to_sq_match", "from_sq_match", "piece_match", "multiline",
+    "em_extracted", "same_move", "legal", "ambiguous", "to_sq_match", "from_sq_match", "piece_match", "multiline",
 ]
 
 
@@ -147,6 +190,8 @@ def san_error_breakdown(analyzed_df: pd.DataFrame) -> pd.Series:
     def bucket(r):
         if r["em_extracted"]:
             return "exact"
+        if r["same_move"] and r["ambiguous"]:
+            return "same move, under-disambiguated"
         if r["same_move"]:
             return "same move, notation differs"
         if not r["legal"]:
@@ -266,6 +311,64 @@ def rescore_cached_san_results(task: str, fens: Iterable[str], hf_org_prefix: st
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True).sort_values("same_move", ascending=False).reset_index(drop=True)
+
+
+def backfill_cached_metrics(
+    table: pd.DataFrame,
+    task: str,
+    fens: Optional[Iterable[str]] = None,
+    hf_org_prefix: str = "bdatm-project",
+    drop_models: Iterable[str] = (),
+) -> pd.DataFrame:
+    """
+    Recomputes the diagnostic columns (FEN_DIAGNOSTIC_COLUMNS for task1,
+    SAN_DIAGNOSTIC_COLUMNS for task2/3) of a model-comparison table from the
+    per-sample CSVs cached on the Hub -- no inference.
+
+    Rows evaluated before those columns existed otherwise show NaN next to
+    rows evaluated after, and rows evaluated under an older version of a
+    metric (e.g. before ambiguous SAN was credited) would mix definitions.
+    The per-sample predictions are the source of truth, so every row with a
+    CSV gets all its diagnostic columns recomputed with the current code;
+    strict metrics (exact_match, CER, ...) are left as they are. A row is
+    matched to `per_sample/<slug>.csv` with the same slug
+    `evaluate_with_cache` writes; rows without a CSV (evaluated before
+    per-sample caching) keep whatever they have. Rows named in `drop_models` are
+    removed (e.g. stale results of a broken run). `fens` (the test split's
+    `fen` column) is required for task2/task3.
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    if task not in ("task1", "task2", "task3"):
+        raise ValueError(f"backfill_cached_metrics: unknown task '{task}'")
+    if task != "task1" and fens is None:
+        raise ValueError("backfill_cached_metrics: `fens` is required for task2/task3")
+    fens = list(fens) if fens is not None else None
+    cols = FEN_DIAGNOSTIC_COLUMNS if task == "task1" else SAN_DIAGNOSTIC_COLUMNS
+
+    repo_id = f"{hf_org_prefix}/evaluation-results-{task}"
+    cached = {
+        f[len("per_sample/"):-4]: f for f in HfApi().list_repo_files(repo_id, repo_type="dataset")
+        if f.startswith("per_sample/") and f.endswith(".csv")
+    }
+    out = table[~table["model_name"].isin(list(drop_models))].reset_index(drop=True).copy()
+    for col in cols:
+        if col not in out.columns:
+            out[col] = float("nan")
+    filled = []
+    for i, name in out["model_name"].items():
+        slug = str(name).lower().replace(" ", "_")
+        if slug not in cached:
+            continue
+        df = pd.read_csv(hf_hub_download(repo_id, cached[slug], repo_type="dataset"), keep_default_na=False)
+        analyzed = analyze_fen_predictions(df) if task == "task1" else analyze_san_predictions(df, fens)
+        for col in cols:
+            out.loc[i, col] = analyzed[col].mean()
+        filled.append(name)
+    missing = [n for n in out["model_name"] if str(n).lower().replace(" ", "_") not in cached]
+    print(f"[{task}] recomputed diagnostics for {len(filled)} row(s) from per-sample CSVs"
+          + (f"; no per-sample CSV (left as NaN): {missing}" if missing else ""))
+    return out
 
 
 # ---------------------------------------------------------------------------
