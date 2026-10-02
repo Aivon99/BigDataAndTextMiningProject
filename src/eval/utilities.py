@@ -15,7 +15,8 @@ from transformers import (
     TrainingArguments,
 )
 from huggingface_hub import HfApi, snapshot_download, hf_hub_download
-from peft import get_peft_model
+from peft import get_peft_model, set_peft_model_state_dict
+from peft.utils import load_peft_weights
 from functools import partial
 from torch.utils.data import DataLoader
 from datasets import load_dataset, Dataset
@@ -116,6 +117,39 @@ def find_resumable_checkpoint(repo_id: str) -> str | None:
         print(f"No resumable checkpoint found for '{repo_id}' ({e}); starting fresh.")
 
     return None
+
+
+def training_is_complete(checkpoint_dir: str) -> bool:
+    """
+    True if the Trainer checkpoint in `checkpoint_dir` belongs to a run that
+    already finished -- stopped early (EarlyStoppingCallback) or reached
+    max_steps -- as recorded in its trainer_state.json.
+    """
+    state = json.loads((Path(checkpoint_dir) / "trainer_state.json").read_text())
+    control = state.get("stateful_callbacks", {}).get("TrainerControl", {}).get("args", {})
+    return bool(control.get("should_training_stop")) or state["global_step"] >= state["max_steps"]
+
+
+def train_or_load_finished(trainer, repo_id: str, resume_checkpoint: str | None):
+    """
+    `trainer.train(resume_from_checkpoint=...)`, except when the Hub run in
+    `repo_id` already finished: then the final adapter pushed to the repo
+    root is loaded into `trainer.model` and training is skipped.
+
+    Needed because resuming a finished run is not a no-op: Trainer resets
+    `should_training_stop` in on_train_begin, so a run that early-stopped at
+    epoch 9/10 trains epoch 10 again; and the best checkpoint it recorded
+    lives on the old runtime's disk, so load_best_model_at_end silently
+    keeps the last epoch. The re-push would then replace the best weights
+    and change the adapter's Hub commit, invalidating every cached
+    evaluation keyed to it (see evaluate_with_cache's adapter_repo_id).
+    """
+    if resume_checkpoint and training_is_complete(resume_checkpoint):
+        print(f"Training for '{repo_id}' already finished on the Hub -- skipping training and loading its final adapter.")
+        set_peft_model_state_dict(trainer.model, load_peft_weights(repo_id))
+        return None
+    return trainer.train(resume_from_checkpoint=resume_checkpoint)
+
 
 class Qwen35VisionDataCollator:
     def __init__(self, processor):
@@ -561,6 +595,75 @@ def _eval_results_repo_id(task: str, hf_org_prefix: str) -> str:
     return f"{hf_org_prefix}/evaluation-results-{task}"
 
 
+_RESULTS_PARQUET = "data/train-00000-of-00001.parquet"
+
+# Dataset card for the results tables: declares the data files but NOT the
+# column schema, so readers infer it from the parquet itself. A card written
+# by Dataset.push_to_hub pins the columns, and push_to_hub does not update
+# them when a column is added -- after `adapter_sha` was introduced, the
+# Task 1 card still listed the old 5 columns and every
+# load_dataset("evaluation-results-task1") raised a CastError.
+_RESULTS_CARD = """---
+configs:
+- config_name: default
+  data_files:
+  - split: train
+    path: data/train-*
+---
+Model-comparison table for this task: one row per evaluated model, written by
+`push_results_table` in `src/eval/utilities.py`. Per-sample predictions are in
+`per_sample/`.
+"""
+
+
+def load_results_table(repo_id: str) -> pd.DataFrame | None:
+    """
+    Reads a results table straight from its parquet file(s) on the Hub,
+    or returns None if the repo / table doesn't exist yet. Bypasses
+    `load_dataset`, so a stale schema in the dataset card can't break it.
+    Network/auth errors are raised, not mistaken for "nothing cached".
+    """
+    api = HfApi()
+    if not api.repo_exists(repo_id=repo_id, repo_type="dataset"):
+        return None
+    files = sorted(
+        f for f in api.list_repo_files(repo_id, repo_type="dataset")
+        if f.startswith("data/") and f.endswith(".parquet")
+    )
+    if not files:
+        return None
+    return pd.concat(
+        [pd.read_parquet(hf_hub_download(repo_id, f, repo_type="dataset")) for f in files],
+        ignore_index=True,
+    )
+
+
+def push_results_table(repo_id: str, table: pd.DataFrame, commit_message: str = "Update results table") -> None:
+    """
+    Replaces the results table on the Hub with `table` in a single commit:
+    one parquet file plus a schema-free dataset card (see _RESULTS_CARD),
+    removing any other parquet shard so readers never see a mix of old and new.
+    """
+    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
+    stale = [
+        f for f in api.list_repo_files(repo_id, repo_type="dataset")
+        if f.startswith("data/") and f.endswith(".parquet") and f != _RESULTS_PARQUET
+    ]
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=commit_message,
+        operations=[
+            CommitOperationAdd(_RESULTS_PARQUET, table.reset_index(drop=True).to_parquet(index=False)),
+            CommitOperationAdd("README.md", _RESULTS_CARD.encode("utf-8")),
+            *[CommitOperationDelete(f) for f in stale],
+        ],
+    )
+
+
 def load_or_init_results_table(task: str, hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
     """
     Loads the running model-comparison table for `task` from the Hub (the
@@ -576,13 +679,12 @@ def load_or_init_results_table(task: str, hf_org_prefix: str = "bdatm-project") 
     than starting over or crashing with a NameError.
     """
     repo_id = _eval_results_repo_id(task, hf_org_prefix)
-    try:
-        table = load_dataset(repo_id, split="train").to_pandas()
-        print(f"Loaded existing comparison table for {task} from '{repo_id}' ({len(table)} model(s) already evaluated).")
-        return table
-    except Exception:
+    table = load_results_table(repo_id)
+    if table is None:
         print(f"No existing comparison table found for {task} on the Hub (or repo doesn't exist yet) -- starting fresh.")
         return pd.DataFrame()
+    print(f"Loaded existing comparison table for {task} from '{repo_id}' ({len(table)} model(s) already evaluated).")
+    return table
 
 
 def append_or_replace(all_results: pd.DataFrame, summary_df: pd.DataFrame) -> pd.DataFrame:
@@ -639,8 +741,10 @@ def evaluate_with_cache(
     adapter_sha = HfApi().model_info(adapter_repo_id).sha if adapter_repo_id else None
 
     if not force:
-        try:
-            table = load_dataset(repo_id, split="train").to_pandas()
+        # Read errors propagate on purpose: swallowing them used to turn a
+        # broken table into a silent cache miss, re-running every evaluation.
+        table = load_results_table(repo_id)
+        if table is not None and "model_name" in table.columns:
             match = table[table["model_name"] == model_name]
             if adapter_sha is not None and len(match) > 0:
                 cached_sha = match["adapter_sha"].iloc[0] if "adapter_sha" in match.columns else None
@@ -659,8 +763,6 @@ def evaluate_with_cache(
                 except Exception:
                     results_df = None  # summary is cached but the per-sample file isn't (e.g. an older cache entry)
                 return results_df, summary_df
-        except Exception:
-            pass  # repo/table doesn't exist yet, or nothing cached for this model -- fall through to a real eval
 
     results_df, summary_df = _EVAL_FUNCS[task](
         model=model, processor=processor, dataset_split=dataset_split, model_name=model_name
@@ -678,13 +780,11 @@ def evaluate_with_cache(
         commit_message=f"Cache per-sample results for '{model_name}' ({task})",
     )
 
-    try:
-        existing = load_dataset(repo_id, split="train").to_pandas()
-        existing = existing[existing["model_name"] != model_name]
-        updated = pd.concat([existing, summary_df], ignore_index=True)
-    except Exception:
-        updated = summary_df
-    Dataset.from_pandas(updated, preserve_index=False).push_to_hub(repo_id)
+    # Upsert into the existing table. A read failure must raise here: the old
+    # fallback (push just this one row) wiped every other model's results.
+    existing = load_results_table(repo_id)
+    updated = append_or_replace(existing if existing is not None else pd.DataFrame(), summary_df)
+    push_results_table(repo_id, updated, commit_message=f"Cache evaluation for '{model_name}' ({task})")
     print(f"[{task}] Cached evaluation for '{model_name}' -- pushed to '{repo_id}'.")
 
     return results_df, summary_df
@@ -980,7 +1080,7 @@ def finetune_and_push_chessboard_model(
         print(f"Resuming training for {task} ({strategy_name} reordering) from {resume_checkpoint}...")
     else:
         print(f"Training model for {task} with {strategy_name} reordering...")
-    trainer_instance.train(resume_from_checkpoint=resume_checkpoint)
+    train_or_load_finished(trainer_instance, repo_id_target, resume_checkpoint)
 
     # 8. Push final weights and processor directly to Hugging Face Hub
     print(
