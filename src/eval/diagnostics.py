@@ -487,24 +487,17 @@ def supervised_tokens_preview(sample: dict, processor) -> str:
     return text
 
 
-def _answer_nll(model, processor, frames: list, prompt: str, target: str) -> float:
-    """Mean NLL of the answer tokens given `frames` + `prompt` (teacher forcing)."""
-    import torch
-    from eval.utilities import preprocess_function
-
-    sample = {"task": "task3" if len(frames) == 2 else "task2", "prompt": prompt, "target": target,
-              "image": frames[0]}
-    if len(frames) == 2:
-        sample["image_t1"] = frames[1]
-    p = preprocess_function(sample, processor)
-    inputs = {}
-    for k, v in p.items():
-        if k == "labels":
-            continue
-        inputs[k] = (v if k in ("pixel_values", "image_grid_thw") else v.unsqueeze(0)).to(model.device)
-    labels = p["labels"].unsqueeze(0).to(model.device)
-    with torch.no_grad():
-        return model(**inputs, labels=labels).loss.item()
+def _split_frame_patches(pixel_values, image_grid_thw):
+    """
+    Splits the processor's flattened `pixel_values` of a two-image sample into
+    (frame 1 patches, frame 2 patches), using `image_grid_thw` (rows per image
+    = t*h*w). Returns None unless both frames have the same patch grid -- the
+    only case where frames can be swapped without changing the token sequence.
+    """
+    sizes = [int(n) for n in image_grid_thw.prod(dim=-1).tolist()]
+    if len(sizes) != 2 or sizes[0] != sizes[1] or pixel_values.shape[0] != sum(sizes):
+        return None
+    return pixel_values[: sizes[0]], pixel_values[sizes[0]:]
 
 
 def frame_ablation_losses(model, processor, dataset_split, n_samples: int = 50) -> pd.DataFrame:
@@ -522,20 +515,47 @@ def frame_ablation_losses(model, processor, dataset_split, n_samples: int = 50) 
     Note the loss also covers the trivially-predictable
     "<think></think>" / "<|im_end|>" tokens, so differences are diluted --
     compare conditions, not absolute values.
+
+    Each sample is preprocessed once, with `preprocess_function` (the
+    training path, so tokens and labels are exactly what the model was
+    trained on). Both frames are 512px, so all four conditions share the same
+    token sequence and differ only in the order of the two frames' image
+    patches -- the conditions are built by reordering those, not by
+    re-running the (CPU-bound) image processor four times.
     """
+    import torch
+    from tqdm.auto import tqdm
+    from eval.utilities import preprocess_function
+
     model.eval()
     n = min(n_samples, len(dataset_split))
     rows = []
-    for i in range(n):
+    for i in tqdm(range(n), desc="Frame ablation"):
         s = dataset_split[i]
-        t, t1 = s["image"], s["image_t1"]
-        rows.append({
-            "sample_id": s["sample_id"],
-            "correct": _answer_nll(model, processor, [t, t1], s["prompt"], s["target"]),
-            "swapped": _answer_nll(model, processor, [t1, t], s["prompt"], s["target"]),
-            "both_t": _answer_nll(model, processor, [t, t], s["prompt"], s["target"]),
-            "both_t1": _answer_nll(model, processor, [t1, t1], s["prompt"], s["target"]),
-        })
+        p = preprocess_function(
+            {"task": "task3", "prompt": s["prompt"], "target": s["target"],
+             "image": s["image"], "image_t1": s["image_t1"]},
+            processor,
+        )
+        frames = _split_frame_patches(p["pixel_values"], p["image_grid_thw"])
+        if frames is None:
+            raise ValueError(
+                f"{s['sample_id']}: the two frames don't have identical patch grids "
+                f"({p['image_grid_thw'].tolist()}), so they can't be swapped in place"
+            )
+        f_t, f_t1 = frames
+        shared = {
+            k: (v if k == "image_grid_thw" else v.unsqueeze(0)).to(model.device)
+            for k, v in p.items() if k not in ("labels", "pixel_values")
+        }
+        labels = p["labels"].unsqueeze(0).to(model.device)
+        row = {"sample_id": s["sample_id"]}
+        conditions = {"correct": (f_t, f_t1), "swapped": (f_t1, f_t), "both_t": (f_t, f_t), "both_t1": (f_t1, f_t1)}
+        for name, (first, second) in conditions.items():
+            with torch.no_grad():
+                out = model(**shared, pixel_values=torch.cat([first, second]).to(model.device), labels=labels)
+            row[name] = out.loss.item()
+        rows.append(row)
     df = pd.DataFrame(rows)
     means = df.drop(columns="sample_id").mean()
     print("Mean answer NLL by frame condition (lower = more confident in the true move):")

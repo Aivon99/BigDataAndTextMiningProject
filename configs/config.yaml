@@ -20,3 +20,5 @@ dataset_generation:
   n_per_turn: 2000
   
   image_size: 512
+
+
