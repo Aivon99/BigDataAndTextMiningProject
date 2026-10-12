@@ -380,7 +380,7 @@ def training_health_report(repo_id: str, jump_threshold: float = 0.4, verbose: b
     Inspects a Trainer run pushed with `hub_strategy="checkpoint"`: eval loss
     per epoch, the train loss at start/end, and whether the run carries a
     training-recipe marker matching the current code
-    (`eval.utilities.TRAINING_RECIPE`).
+    (`training.checkpoints.TRAINING_RECIPE`).
 
     Flags an epoch-to-epoch eval-loss change larger than `jump_threshold`
     (relative) that comes right after a plateau (previous change < 10%).
@@ -447,7 +447,7 @@ def training_health_report(repo_id: str, jump_threshold: float = 0.4, verbose: b
             )
 
     try:
-        from eval.utilities import TRAINING_RECIPE, read_training_recipe
+        from training.checkpoints import TRAINING_RECIPE, read_training_recipe
         recipe = read_training_recipe(repo_id)
         report["recipe"] = recipe
         if recipe != TRAINING_RECIPE:
@@ -477,7 +477,7 @@ def supervised_tokens_preview(sample: dict, processor) -> str:
     tokens whose label != -100 -- i.e. exactly what the loss is computed on.
     Expected for Task 2/3: "<think>\\n\\n</think>\\n\\n<MOVE><|im_end|>\\n".
     """
-    from eval.utilities import preprocess_function
+    from training.preprocessing import preprocess_function
 
     processed = preprocess_function(sample, processor)
     labels = processed["labels"]
@@ -525,7 +525,7 @@ def frame_ablation_losses(model, processor, dataset_split, n_samples: int = 50) 
     """
     import torch
     from tqdm.auto import tqdm
-    from eval.utilities import preprocess_function
+    from training.preprocessing import preprocess_function
 
     model.eval()
     n = min(n_samples, len(dataset_split))

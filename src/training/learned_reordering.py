@@ -13,7 +13,7 @@ for the reference implementation this is adapted from), but reworked for a
   model's forward pass. This project has no such hook into Qwen's vision
   tower -- reordering happens *before* the model ever sees the image, as a
   literal pixel-tile rearrangement (`apply_patch_permutation` in
-  `src/eval/utilities.py`). That rearrangement is discrete/non-differentiable,
+  `src/training/reordering.py`). That rearrangement is discrete/non-differentiable,
   which is exactly why the policy is trained via REINFORCE (policy gradient)
   rather than backprop, same as REOrder's own approach.
 - The reward is the (negative) language-modeling loss on the target FEN/SAN
@@ -54,7 +54,9 @@ from peft import get_peft_model, set_peft_model_state_dict
 from peft.utils import load_peft_weights
 from transformers import get_linear_schedule_with_warmup
 
-from eval.utilities import TRAINING_RECIPE, apply_patch_permutation, preprocess_function
+from training.checkpoints import TRAINING_RECIPE
+from training.preprocessing import preprocess_function
+from training.reordering import apply_patch_permutation
 
 _CHECKPOINT_SUBDIR = "last-learned-checkpoint"
 
@@ -190,7 +192,7 @@ def _save_learned_reordering_checkpoint(
 
 def find_resumable_learned_reordering_checkpoint(repo_id: str, recipe: Optional[str] = None) -> Optional[Tuple[Path, dict]]:
     """
-    Mirrors `eval.utilities.find_resumable_checkpoint`, but for the
+    Mirrors `training.checkpoints.find_resumable_checkpoint`, but for the
     `last-learned-checkpoint/` folder this module's own checkpointing writes
     (a `transformers.Trainer` checkpoint and this one are not interchangeable
     -- different files, different loading code). Returns

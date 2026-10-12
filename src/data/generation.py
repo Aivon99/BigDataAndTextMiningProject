@@ -3,14 +3,13 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import cairosvg
 import chess
 import chess.svg
 import pandas as pd
 from PIL import Image
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 
@@ -131,116 +130,6 @@ def build_sample(
             img.save(sample_dir / fname)
 
     return {"images": images, "metadata": metadata}
-
-
-def iter_task_samples(
-    df: pd.DataFrame,
-    task: str,
-    image_size: int = 512,
-) -> Iterator[Dict[str, Union[Image.Image, str]]]:
-    """
-    Lazily yields one flattened sample per row for `task`, rendering images
-    on the fly and never writing to disk. Feed directly into
-    `datasets.Dataset.from_generator` so a full task/split dataset can be
-    built and pushed to the Hub without holding all images in memory at once.
-    """
-    if task not in PROMPTS:
-        raise ValueError(f"Unsupported task '{task}'. Expected one of: {list(PROMPTS.keys())}")
-
-    for idx, (_, row) in enumerate(df.iterrows()):
-        sample_id = f"sample_{idx:06d}"
-        fen = row["FEN"]
-        moves = row.get("Moves", None)
-        puzzle_id = str(row.get("PuzzleId", sample_id))
-
-        board = chess.Board(fen)
-        first_move_uci = moves.split()[0] if moves and isinstance(moves, str) else None
-        first_move = chess.Move.from_uci(first_move_uci) if first_move_uci else None
-
-        base = {
-            "sample_id": sample_id,
-            "puzzle_id": puzzle_id,
-            "fen": fen,
-            "prompt": PROMPTS[task],
-        }
-
-        if task == "task1":
-            yield {
-                **base,
-                "image": render_board_svg(board=board, size=image_size),
-                "target": fen,
-            }
-
-        elif task == "task2":
-            if first_move is None:
-                raise ValueError(f"Task 2 requires a valid move sequence, none found for FEN: {fen}")
-            yield {
-                **base,
-                "image": render_board_svg(board=board, size=image_size, lastmove=first_move),
-                "target": board.san(first_move),
-            }
-
-        elif task == "task3":
-            if first_move is None:
-                raise ValueError(f"Task 3 requires a valid move sequence, none found for FEN: {fen}")
-            target = board.san(first_move)
-            image_t = render_board_svg(board=board, size=image_size)
-            board.push(first_move)
-            image_t1 = render_board_svg(board=board, size=image_size)
-            yield {
-                **base,
-                "image_t": image_t,
-                "image_t1": image_t1,
-                "target": target,
-            }
-
-
-def generate_dataset(
-    df: pd.DataFrame,
-    task: str,
-    output_dir: Union[str, Path],
-    image_size: int = 512,
-) -> None:
-    """Generates a batch dataset for a specific task and creates a clean metadata.jsonl for Hugging Face ImageFolder."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    dataset_records = []
-
-    for idx, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc=f"Generating {task}")):
-        sample_id = f"sample_{idx:06d}"
-        
-        result = build_sample(
-            fen=row["FEN"],
-            moves=row.get("Moves", None),
-            task=task,
-            sample_id=sample_id,
-            puzzle_id=str(row.get("PuzzleId", sample_id)),
-            output_dir=output_path,
-            image_size=image_size,
-        )
-
-        metadata = result["metadata"]
-        saved_files = metadata["image_files"]
-
-        # Base record with uniform schema across all tasks to prevent CastError
-        record = {
-            "sample_id": sample_id,
-            "puzzle_id": metadata["puzzle_id"],
-            "task": task,
-            "fen": metadata["fen"],
-            "prompt": metadata["prompt"],
-            "target": metadata["target"],
-            "file_name": f"{sample_id}/{saved_files[0]}",
-            "file_name_t1": f"{sample_id}/{saved_files[1]}" if len(saved_files) > 1 else ""
-        }
-
-        dataset_records.append(record)
-
-    metadata_file_path = output_path / "metadata.jsonl"
-    with open(metadata_file_path, "w", encoding="utf-8") as f:
-        for record in dataset_records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _render_sample_to_disk(args: tuple) -> dict:
