@@ -15,6 +15,20 @@ from training.checkpoints import (
     train_or_load_finished,
 )
 from training.preprocessing import Qwen35OnTheFlyCollator
+from training.reordering import resolve_square_order
+from training.token_reordering import install_token_reordering
+
+
+def experiment_repo_id(task: str, strategy: str, tag: str | None = None, hf_org_prefix: str = "bdatm-project") -> str:
+    """Hub repo of a LoRA run. The tag (e.g. "tok256") keeps the token-level runs
+    apart from the first, pixel-based ones, which have no tag.
+    """
+    return f"{hf_org_prefix}/qwen-{task}-{strategy}{'-' + tag if tag else ''}-lora"
+
+
+def experiment_model_name(label: str, tag: str | None = None) -> str:
+    """Name of a row in the results table, e.g. "Qwen + LoRA (Zigzag - SFT) [tok256]"."""
+    return f"{label} [{tag}]" if tag else label
 
 
 def finetune_and_push_chessboard_model(
@@ -25,28 +39,38 @@ def finetune_and_push_chessboard_model(
     peft_config,
     task,
     hf_org_prefix="bdatm-project",
-    repo_root=None,
+    tag=None,
+    token_reordering=True,
     num_train_epochs=10,
     early_stopping_patience=2,
 ):
-    print(f"\n==============================================")
-    print(
-        f"Starting pipeline for TASK: {task.upper()} | STRATEGY:"
-        f" {strategy_name.upper()}"
-    )
-    print(f"==============================================")
+    """LoRA fine-tuning with a fixed scan order (any strategy of
+    get_patch_reordering_indices, raster included).
 
+    With token_reordering=True the order is applied to the visual tokens and
+    the images are unchanged; False reproduces the first, pixel-tile runs.
+    The image size is the one set on the processor (configure_image_resolution).
+    Returns the trained model with its reorderer set to the strategy's order.
+    """
     if task not in ("task1", "task2", "task3"):
         raise ValueError(f"Unknown task: {task}")
+    repo_id_target = experiment_repo_id(task, strategy_name, tag, hf_org_prefix)
+    mode = "token-level" if token_reordering else "LEGACY pixel-tile"
+    print("\n==============================================")
+    print(f"TASK: {task.upper()} | STRATEGY: {strategy_name.upper()} ({mode}) -> {repo_id_target}")
+    print("==============================================")
 
-    print("Applying LoRA to the provided model...")
+    if token_reordering:
+        install_token_reordering(model).set_order(resolve_square_order(strategy_name))
+        data_collator = Qwen35OnTheFlyCollator(processor=processor)
+    else:
+        data_collator = Qwen35OnTheFlyCollator(processor=processor, strategy=strategy_name)
+
     lora_model_instance = get_peft_model(model, peft_config)
-
-    repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
     resume_checkpoint = find_resumable_checkpoint(repo_id_target)
 
     training_args_instance = TrainingArguments(
-        output_dir=f"./temp_{task}_{strategy_name}_output",
+        output_dir=f"./temp_{task}_{strategy_name}_{tag or 'pixel'}_output",
         per_device_train_batch_size=8,
         per_device_eval_batch_size=8,
         gradient_accumulation_steps=1,
@@ -68,8 +92,6 @@ def finetune_and_push_chessboard_model(
         report_to="none",
     )
 
-    data_collator = Qwen35OnTheFlyCollator(processor=processor, strategy=strategy_name)
-
     trainer_instance = Trainer(
         model=lora_model_instance,
         args=training_args_instance,
@@ -82,27 +104,16 @@ def finetune_and_push_chessboard_model(
         ],
     )
 
-    if resume_checkpoint:
-        print(f"Resuming training for {task} ({strategy_name} reordering) from {resume_checkpoint}...")
-    else:
-        print(f"Training model for {task} with {strategy_name} reordering...")
+    print(("Resuming from " + resume_checkpoint) if resume_checkpoint else "Training from scratch...")
     if not train_or_load_finished(trainer_instance, repo_id_target, resume_checkpoint):
         print(f"Nothing new to push for {repo_id_target}.")
         return trainer_instance.model
 
-    print(
-        f"Pushing model and processor to Hugging Face Hub: {repo_id_target}..."
-    )
-
+    print(f"Pushing model and processor to Hugging Face Hub: {repo_id_target}...")
     trainer_instance.model.push_to_hub(
         repo_id_target,
-        commit_message=(
-            f"Training complete for {task} using {strategy_name} reordering"
-            " strategy"
-        ),
+        commit_message=f"Training complete for {task}, {strategy_name} order ({mode})",
     )
     processor.push_to_hub(repo_id_target)
-
     print(f"Finished! Successfully uploaded to Hub: {repo_id_target}")
-
     return trainer_instance.model

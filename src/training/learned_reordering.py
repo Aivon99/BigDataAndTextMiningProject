@@ -1,147 +1,116 @@
-"""Learned patch reordering: a small policy learns which patch order works
-best while LoRA trains the model. Based on the REOrder paper.
+"""Learned reordering (REOrder): a Plackett-Luce policy over the 64 squares,
+trained together with LoRA by REINFORCE, using REOrder's own policy.
+
+- The order is applied to the visual tokens (training/token_reordering.py), so
+  every order shows the same board and the reward measures only the order.
+- REOrder's recipe: the policy starts after a warm-up in raster order, with
+  REOrder's row-major init, and the Gumbel temperature goes from 0.2 to 0.
+- Reward = -cross-entropy of the answer. With orders_per_sample=2 two orders
+  are scored on the same sample and compared with each other, so the
+  difficulty of the puzzle cancels out; with 1, a moving-average baseline.
+- Effective batch 8, gradient clipping, shuffled data every epoch, and the
+  best epoch by validation loss is kept.
+
+Checkpoints are pushed to the Hub during training and resumed automatically.
 """
 
 import json
+import math
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
-import torch.nn as nn
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from peft import get_peft_model, set_peft_model_state_dict
 from peft.utils import load_peft_weights
 from transformers import get_linear_schedule_with_warmup
 
 from training.checkpoints import TRAINING_RECIPE
+from training.finetune import experiment_repo_id
 from training.preprocessing import preprocess_function
-from training.reordering import apply_patch_permutation
+from training.reorder_lib import load_reorder
+from training.token_reordering import install_token_reordering
 
+LEARNED_RECIPE = f"{TRAINING_RECIPE}+token-reorder-pl-v1"
 _CHECKPOINT_SUBDIR = "last-learned-checkpoint"
-
-DEFAULT_INIT_SPACING = 2.0
-
-
-def _learned_recipe(init_spacing: float) -> str:
-    return f"{TRAINING_RECIPE}+pl-init-spacing-{init_spacing:g}"
+_BEST_SUBDIR = "best-learned-checkpoint"
+_ORDER_FILE = "learned_order.json"
+_NO_UNSQUEEZE = {"pixel_values", "image_grid_thw"}
 
 
-def _sample_gumbel(shape, device, eps=1e-8):
-    u = torch.empty(shape, device=device).uniform_(0, 1)
-    return -torch.log(-torch.log(u + eps) + eps)
-
-
-class PlackettLucePatchPolicy(nn.Module):
-    """Learns a ranking of the board patches and samples patch orders from it.
-    init_spacing sets how close the samples stay to raster order at the start.
-    """
-
-    def __init__(self, grid_size: int = 8, baseline_momentum: float = 0.9, init_spacing: float = DEFAULT_INIT_SPACING):
-        super().__init__()
-        num_patches = grid_size * grid_size
-        self.grid_size = grid_size
-        self.num_patches = num_patches
-        self.logits = nn.Parameter(-init_spacing * torch.arange(num_patches, dtype=torch.float32))
-        self.register_buffer("running_baseline", torch.tensor(0.0))
-        self.baseline_momentum = baseline_momentum
-        self.temperature = 1.0
-
-    def sample(self, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns a batch of permutations and their log probabilities."""
-        logits = self.logits.unsqueeze(0)
-        g = _sample_gumbel((batch_size, self.num_patches), device=logits.device)
-        z = logits + self.temperature * g
-
-        sorted_indices = torch.argsort(z, dim=-1, descending=True)
-        logits_sorted = torch.gather(logits.expand(batch_size, -1), dim=1, index=sorted_indices)
-
-        log_cumsums_rev = torch.logcumsumexp(torch.flip(logits_sorted, dims=[-1]), dim=-1)
-        log_denominators = torch.flip(log_cumsums_rev, dims=[-1])
-        log_prob = (logits_sorted - log_denominators).sum(dim=-1)
-
-        return sorted_indices, log_prob
-
-    def greedy_permutation(self) -> list:
-        """Best patch order according to the policy, used at evaluation time."""
-        return torch.argsort(self.logits, descending=True).tolist()
-
-    def update_baseline(self, reward: torch.Tensor) -> None:
-        with torch.no_grad():
-            self.running_baseline.copy_(
-                self.running_baseline * self.baseline_momentum
-                + (1.0 - self.baseline_momentum) * reward.mean()
-            )
-
-    def reinforce_loss(self, reward: torch.Tensor, log_prob: torch.Tensor) -> torch.Tensor:
-        advantage = reward.detach() - self.running_baseline
-        return -(advantage * log_prob).mean()
-
-
-def _save_learned_reordering_checkpoint(
-    local_dir: Path,
-    repo_id: str,
-    lora_model,
-    policy: "PlackettLucePatchPolicy",
-    model_optimizer,
-    policy_optimizer,
-    scheduler,
-    epoch: int,
-    step_in_epoch: int,
-    global_step: int,
-    recipe: str,
-) -> None:
-    ckpt_dir = local_dir / _CHECKPOINT_SUBDIR
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    lora_model.save_pretrained(str(ckpt_dir))
-    torch.save(policy.state_dict(), ckpt_dir / "policy.pt")
-    torch.save(model_optimizer.state_dict(), ckpt_dir / "model_optimizer.pt")
-    torch.save(policy_optimizer.state_dict(), ckpt_dir / "policy_optimizer.pt")
-    torch.save(scheduler.state_dict(), ckpt_dir / "scheduler.pt")
-    metadata = {"epoch": epoch, "step_in_epoch": step_in_epoch, "global_step": global_step, "recipe": recipe}
-    (ckpt_dir / "metadata.json").write_text(json.dumps(metadata))
-
-    api = HfApi()
-    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-    api.upload_folder(
-        repo_id=repo_id,
-        repo_type="model",
-        folder_path=str(ckpt_dir),
-        path_in_repo=_CHECKPOINT_SUBDIR,
-        commit_message=f"Learned-reordering checkpoint: epoch {epoch}, step {step_in_epoch} (global step {global_step})",
+def make_policy(grid_size: int = 8):
+    """REOrder's Plackett-Luce policy, one independent order per sample."""
+    return load_reorder().PlackettLucePolicy(
+        num_patches=grid_size * grid_size, method="gumbel", granularity="image", logit_init="row-major"
     )
 
 
-def find_resumable_learned_reordering_checkpoint(repo_id: str, recipe: Optional[str] = None) -> Optional[Tuple[Path, dict]]:
-    """Like find_resumable_checkpoint, but for the checkpoints of the learned
-    reordering loop.
-    """
-    try:
-        api = HfApi()
-        if not api.repo_exists(repo_id=repo_id, repo_type="model"):
-            return None
+def greedy_order(policy) -> list:
+    """The policy's single best ordering (argsort of its logits, no noise) -- used at evaluation."""
+    return torch.argsort(policy.logits.detach(), descending=True).tolist()
 
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            repo_type="model",
-            allow_patterns=f"{_CHECKPOINT_SUBDIR}/*",
-        )
-        candidate = Path(local_dir) / _CHECKPOINT_SUBDIR
-        metadata_path = candidate / "metadata.json"
-        if candidate.exists() and metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text())
-            if recipe is not None and metadata.get("recipe") != recipe:
-                print(
-                    f"Ignoring the learned-reordering checkpoint in '{repo_id}': recipe "
-                    f"{metadata.get('recipe')!r} != current {recipe!r}. Starting fresh."
-                )
-                return None
-            print(f"Found a resumable learned-reordering checkpoint on the Hub for '{repo_id}': {candidate}")
-            return candidate, metadata
-    except Exception as e:
-        print(f"No resumable learned-reordering checkpoint found for '{repo_id}' ({e}); starting fresh.")
 
-    return None
+def _to_model_inputs(sample: dict, device) -> tuple:
+    inputs = {}
+    for k, v in sample.items():
+        if k == "labels":
+            continue
+        t = v if torch.is_tensor(v) else torch.tensor(v)
+        inputs[k] = (t if k in _NO_UNSQUEEZE else t.unsqueeze(0)).to(device)
+    labels = sample["labels"]
+    labels = (labels if torch.is_tensor(labels) else torch.tensor(labels)).unsqueeze(0).to(device)
+    return inputs, labels
+
+
+def _raw_sample(row: dict, task: str) -> dict:
+    sample = {"task": task, "image": row["image"], "prompt": row["prompt"], "target": row["target"]}
+    if task == "task3":
+        sample["image_t1"] = row["image_t1"]
+    return sample
+
+
+def _upload(local_dir: Path, repo_id: str, path_in_repo: str, message: str) -> None:
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+    api.upload_folder(repo_id=repo_id, repo_type="model", folder_path=str(local_dir),
+                      path_in_repo=path_in_repo, commit_message=message)
+
+
+def _save_state(local_dir: Path, lora_model, policy, extra: Optional[dict] = None, optimizers=None) -> None:
+    local_dir.mkdir(parents=True, exist_ok=True)
+    lora_model.save_pretrained(str(local_dir))
+    torch.save(policy.state_dict(), local_dir / "policy.pt")
+    if optimizers:
+        for name, obj in optimizers.items():
+            torch.save(obj.state_dict(), local_dir / f"{name}.pt")
+    (local_dir / "metadata.json").write_text(json.dumps({"recipe": LEARNED_RECIPE, **(extra or {})}))
+
+
+def _find_state(repo_id: str, subdir: str) -> Optional[tuple]:
+    """(local_dir, metadata) of a learned-reordering state on the Hub, if its recipe matches."""
+    api = HfApi()
+    if not api.repo_exists(repo_id=repo_id, repo_type="model"):
+        return None
+    if f"{subdir}/metadata.json" not in api.list_repo_files(repo_id, repo_type="model"):
+        return None
+    local = Path(snapshot_download(repo_id=repo_id, repo_type="model", allow_patterns=f"{subdir}/*")) / subdir
+    meta = json.loads((local / "metadata.json").read_text())
+    if meta.get("recipe") != LEARNED_RECIPE:
+        print(f"Ignoring {repo_id}/{subdir}: recipe {meta.get('recipe')!r} != {LEARNED_RECIPE!r}.")
+        return None
+    return local, meta
+
+
+@torch.no_grad()
+def _validation_loss(lora_model, reorderer, processor, rows, task, order, device) -> float:
+    lora_model.eval()
+    losses = []
+    with reorderer.order(order):
+        for row in rows:
+            inputs, labels = _to_model_inputs(preprocess_function(_raw_sample(row, task), processor), device)
+            losses.append(lora_model(**inputs, labels=labels).loss.item())
+    lora_model.train()
+    return sum(losses) / max(len(losses), 1)
 
 
 def train_with_learned_reordering(
@@ -151,152 +120,180 @@ def train_with_learned_reordering(
     peft_config,
     task: str,
     hf_org_prefix: str = "bdatm-project",
+    tag: Optional[str] = None,
     grid_size: int = 8,
-    img_size: int = 512,
-    num_train_epochs: int = 10,
+    num_train_epochs: int = 4,
+    policy_start_after_epochs: int = 1,
+    gumbel_temp_start: float = 0.2,
+    gumbel_temp_end: float = 0.0,
+    orders_per_sample: int = 2,
+    baseline_momentum: float = 0.99,
     learning_rate: float = 2e-4,
-    policy_learning_rate: float = 1e-2,
-    policy_weight: float = 1.0,
-    log_every: int = 10,
+    policy_learning_rate: float = 1e-3,
+    grad_accum_steps: int = 8,
+    max_grad_norm: float = 1.0,
+    val_samples: int = 200,
+    checkpoint_every_steps: int = 100,
+    log_every: int = 50,
     output_dir: str = "./learned_reordering_output",
-    checkpoint_every_steps: int = 200,
-    init_spacing: float = DEFAULT_INIT_SPACING,
+    seed: int = 42,
 ):
-    """Trains LoRA and the reordering policy together with REINFORCE, using the
-    loss as reward.
-
-    A checkpoint is pushed to the Hub during training, so an interrupted run
-    resumes where it stopped. Returns (lora_model, policy, repo_id_target).
+    """
+    Jointly trains LoRA and a REOrder Plackett-Luce policy over square
+    orders. Returns (lora_model, policy, repo_id, order): `lora_model` has
+    its TokenReorderer set to `order`, the order of the best validation
+    epoch (the policy's greedy order, or None = raster if a warm-up epoch
+    was best).
     """
     if task not in ("task1", "task2", "task3"):
         raise ValueError(f"train_with_learned_reordering: unknown task '{task}'")
-
-    repo_id_target = f"{hf_org_prefix}/qwen-{task}-learned-reordering-lora"
-    recipe = _learned_recipe(init_spacing)
-    resume = find_resumable_learned_reordering_checkpoint(repo_id_target, recipe=recipe)
-
+    repo_id = experiment_repo_id(task, "learned", tag, hf_org_prefix)
     device = model.device
+    out = Path(output_dir) / repo_id.split("/")[-1]
+
+    reorderer = install_token_reordering(model, grid_size=grid_size)
     lora_model = get_peft_model(model, peft_config)
     lora_model.train()
+    policy = make_policy(grid_size).to(device)
 
-    policy = PlackettLucePatchPolicy(grid_size=grid_size, init_spacing=init_spacing).to(device)
-
-    model_optimizer = torch.optim.AdamW(lora_model.parameters(), lr=learning_rate)
-    policy_optimizer = torch.optim.Adam(policy.parameters(), lr=policy_learning_rate)
-
+    trainable = [p for p in lora_model.parameters() if p.requires_grad]
+    model_optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
+    policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=policy_learning_rate, weight_decay=0.0)
     train_split = dataset["train"]
-    num_steps = len(train_split) * num_train_epochs
-    scheduler = get_linear_schedule_with_warmup(
-        model_optimizer, num_warmup_steps=0, num_training_steps=num_steps
-    )
+    steps_per_epoch = math.ceil(len(train_split) / grad_accum_steps)
+    scheduler = get_linear_schedule_with_warmup(model_optimizer, 0, steps_per_epoch * num_train_epochs)
+    policy_steps_total = max(1, steps_per_epoch * (num_train_epochs - policy_start_after_epochs))
+    val_rows = dataset["validation"].select(range(min(val_samples, len(dataset["validation"]))))
 
-    start_epoch = 0
-    start_step_in_epoch = 0
-    global_step = 0
+    state = {"epoch": 0, "next_row": 0, "opt_step": 0, "best_val": None, "best_epoch": None}
+    resume = _find_state(repo_id, _CHECKPOINT_SUBDIR)
     if resume is not None:
-        ckpt_dir, metadata = resume
-        set_peft_model_state_dict(lora_model, load_peft_weights(str(ckpt_dir)))
-        policy.load_state_dict(torch.load(ckpt_dir / "policy.pt", map_location=device))
-        model_optimizer.load_state_dict(torch.load(ckpt_dir / "model_optimizer.pt", map_location=device))
-        policy_optimizer.load_state_dict(torch.load(ckpt_dir / "policy_optimizer.pt", map_location=device))
-        scheduler.load_state_dict(torch.load(ckpt_dir / "scheduler.pt", map_location=device))
-        start_epoch = metadata["epoch"]
-        start_step_in_epoch = metadata["step_in_epoch"]
-        global_step = metadata["global_step"]
-        print(
-            f"Resuming learned-reordering training for {task} from epoch {start_epoch}, "
-            f"step {start_step_in_epoch} (global step {global_step})..."
-        )
+        ckpt, meta = resume
+        set_peft_model_state_dict(lora_model, load_peft_weights(str(ckpt)))
+        policy.load_state_dict(torch.load(ckpt / "policy.pt", map_location=device))
+        model_optimizer.load_state_dict(torch.load(ckpt / "model_optimizer.pt", map_location=device))
+        policy_optimizer.load_state_dict(torch.load(ckpt / "policy_optimizer.pt", map_location=device))
+        scheduler.load_state_dict(torch.load(ckpt / "scheduler.pt", map_location=device))
+        state.update({k: meta[k] for k in state if k in meta})
+        print(f"[{task}] Resuming learned reordering at epoch {state['epoch']}, row {state['next_row']} "
+              f"(optimizer step {state['opt_step']}).")
     else:
-        print(f"No resumable learned-reordering checkpoint found for {task}; starting fresh.")
+        print(f"[{task}] Learned reordering: starting fresh -> {repo_id}")
 
-    local_output_dir = Path(output_dir)
+    def checkpoint(message: str) -> None:
+        _save_state(out / _CHECKPOINT_SUBDIR, lora_model, policy, extra=state, optimizers={
+            "model_optimizer": model_optimizer, "policy_optimizer": policy_optimizer, "scheduler": scheduler})
+        _upload(out / _CHECKPOINT_SUBDIR, repo_id, _CHECKPOINT_SUBDIR, message)
 
-    NO_UNSQUEEZE_KEYS = {"pixel_values", "image_grid_thw"}
+    for epoch in range(state["epoch"], num_train_epochs):
+        policy_active = epoch >= policy_start_after_epochs
+        rows = train_split.shuffle(seed=seed + epoch)
+        n_rows = len(rows)
+        running = {"lm": 0.0, "adv": 0.0, "n": 0}
+        for i in range(state["next_row"], n_rows):
+            sample = preprocess_function(_raw_sample(rows[i], task), processor)
+            inputs, labels = _to_model_inputs(sample, device)
 
-    for epoch in range(start_epoch, num_train_epochs):
-        epoch_start_offset = start_step_in_epoch if epoch == start_epoch else 0
-        rows = (
-            train_split.select(range(epoch_start_offset, len(train_split)))
-            if epoch_start_offset else train_split
-        )
-        for row_idx, row in enumerate(rows, start=epoch_start_offset):
-            permutation, log_prob = policy.sample(batch_size=1)
-            perm_list = permutation[0].tolist()
+            if policy_active:
+                policy_step = state["opt_step"] - steps_per_epoch * policy_start_after_epochs
+                frac = min(1.0, max(0, policy_step) / policy_steps_total)
+                policy.temperature = gumbel_temp_start + (gumbel_temp_end - gumbel_temp_start) * frac
+                orders, log_probs, _ = policy(None, batch_size=orders_per_sample)
+            else:
+                orders, log_probs = [None], None
 
-            reordered_image = apply_patch_permutation(
-                row["image"], perm_list, grid_size=grid_size, img_size=img_size
-            )
-            sample_input = {"task": task, "image": reordered_image, "prompt": row["prompt"], "target": row["target"]}
+            with reorderer.order(None if orders[0] is None else orders[0].tolist()):
+                lm_loss = lora_model(**inputs, labels=labels).loss
+            (lm_loss / grad_accum_steps).backward()
+            running["lm"] += lm_loss.item()
+            running["n"] += 1
 
-            if task == "task3":
-                sample_input["image_t1"] = apply_patch_permutation(
-                    row["image_t1"], perm_list, grid_size=grid_size, img_size=img_size
-                )
+            if policy_active:
+                losses = [lm_loss.detach()]
+                with torch.no_grad():
+                    for k in range(1, orders_per_sample):
+                        with reorderer.order(orders[k].tolist()):
+                            losses.append(lora_model(**inputs, labels=labels).loss)
+                rewards = -torch.stack(losses).float()
+                if orders_per_sample > 1:
+                    # leave-one-out baseline: each order vs the others on the SAME sample
+                    advantage = rewards - (rewards.sum() - rewards) / (orders_per_sample - 1)
+                else:
+                    advantage = rewards - policy.running_baseline
+                    policy.running_baseline.copy_(baseline_momentum * policy.running_baseline
+                                                  + (1 - baseline_momentum) * rewards.mean())
+                policy_loss = -(advantage.detach() * log_probs).mean()
+                (policy_loss / grad_accum_steps).backward()
+                running["adv"] += advantage.abs().mean().item()
 
-            sample = preprocess_function(sample_input, processor=processor)
+            if (i + 1) % grad_accum_steps == 0 or i + 1 == n_rows:
+                torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
+                model_optimizer.step()
+                scheduler.step()
+                model_optimizer.zero_grad()
+                if policy_active:
+                    policy_optimizer.step()
+                policy_optimizer.zero_grad()
+                state["opt_step"] += 1
+                state["next_row"] = i + 1
+                if state["opt_step"] % log_every == 0 and running["n"]:
+                    msg = f"[{task}] epoch {epoch} step {state['opt_step']}: lm_loss={running['lm'] / running['n']:.4f}"
+                    if policy_active:
+                        msg += f" |adv|={running['adv'] / running['n']:.4f} temp={policy.temperature:.3f}"
+                    print(msg)
+                    running = {"lm": 0.0, "adv": 0.0, "n": 0}
+                if state["opt_step"] % checkpoint_every_steps == 0 and state["next_row"] < n_rows:
+                    checkpoint(f"Learned reordering: epoch {epoch}, step {state['opt_step']}")
 
-            inputs = {}
-            for k, v in sample.items():
-                if k == "labels":
-                    continue
-                t = v if torch.is_tensor(v) else torch.tensor(v)
-                if k not in NO_UNSQUEEZE_KEYS:
-                    t = t.unsqueeze(0)
-                inputs[k] = t.to(device)
+        # end of epoch: validation loss under the order that would be evaluated
+        eval_order = greedy_order(policy) if policy_active else None
+        val_loss = _validation_loss(lora_model, reorderer, processor, val_rows, task, eval_order, device)
+        print(f"[{task}] epoch {epoch} done: val_loss={val_loss:.4f} "
+              f"(order: {'policy greedy' if eval_order else 'raster'})")
+        if state["best_val"] is None or val_loss < state["best_val"]:
+            state.update({"best_val": val_loss, "best_epoch": epoch})
+            _save_state(out / _BEST_SUBDIR, lora_model, policy,
+                         extra={"epoch": epoch, "val_loss": val_loss, "order": eval_order})
+            _upload(out / _BEST_SUBDIR, repo_id, _BEST_SUBDIR, f"Best so far: epoch {epoch}, val_loss {val_loss:.4f}")
+        state.update({"epoch": epoch + 1, "next_row": 0})
+        checkpoint(f"Learned reordering: end of epoch {epoch}")
 
-            labels = sample["labels"]
-            labels = (labels if torch.is_tensor(labels) else torch.tensor(labels)).unsqueeze(0).to(device)
+    best = _find_state(repo_id, _BEST_SUBDIR)
+    order = None
+    if best is not None:
+        best_dir, meta = best
+        set_peft_model_state_dict(lora_model, load_peft_weights(str(best_dir)))
+        policy.load_state_dict(torch.load(best_dir / "policy.pt", map_location=device))
+        order = meta.get("order")
+        print(f"[{task}] Using the best epoch ({meta['epoch']}, val_loss {meta['val_loss']:.4f}).")
+    reorderer.set_order(order)
 
-            outputs = lora_model(**inputs, labels=labels)
-            lm_loss = outputs.loss
+    print(f"Pushing learned-reordering model to {repo_id}...")
+    lora_model.push_to_hub(repo_id, commit_message=f"Learned reordering ({task}): best epoch")
+    processor.push_to_hub(repo_id)
+    final = out / "final"
+    final.mkdir(parents=True, exist_ok=True)
+    torch.save(policy.state_dict(), final / "policy.pt")
+    (final / _ORDER_FILE).write_text(json.dumps({"order": order, "greedy_order": greedy_order(policy),
+                                                 "recipe": LEARNED_RECIPE}))
+    for name in ("policy.pt", _ORDER_FILE):
+        HfApi().upload_file(path_or_fileobj=str(final / name), path_in_repo=name, repo_id=repo_id,
+                            repo_type="model", commit_message=f"Learned order + policy ({task})")
+    return lora_model, policy, repo_id, order
 
-            model_optimizer.zero_grad()
-            lm_loss.backward()
-            model_optimizer.step()
-            scheduler.step()
 
-            reward = -lm_loss.detach().unsqueeze(0)
-            policy.update_baseline(reward)
-            policy_loss = policy_weight * policy.reinforce_loss(reward, log_prob)
+def load_learned_order(repo_id: str) -> Optional[list]:
+    """The order a finished learned-reordering run selected (None = raster), from the Hub."""
+    path = hf_hub_download(repo_id, _ORDER_FILE, repo_type="model")
+    return json.loads(Path(path).read_text())["order"]
 
-            policy_optimizer.zero_grad()
-            policy_loss.backward()
-            policy_optimizer.step()
 
-            global_step += 1
-            if global_step % log_every == 0:
-                print(
-                    f"[{task}] epoch {epoch} step {global_step}: "
-                    f"lm_loss={lm_loss.item():.4f} policy_loss={policy_loss.item():.4f} "
-                    f"baseline={policy.running_baseline.item():.4f}"
-                )
-
-            if global_step % checkpoint_every_steps == 0:
-                _save_learned_reordering_checkpoint(
-                    local_output_dir, repo_id_target, lora_model, policy,
-                    model_optimizer, policy_optimizer, scheduler,
-                    epoch=epoch, step_in_epoch=row_idx + 1, global_step=global_step, recipe=recipe,
-                )
-                print(f"[{task}] checkpoint saved at epoch {epoch}, step {row_idx + 1} (global step {global_step}).")
-
-        _save_learned_reordering_checkpoint(
-            local_output_dir, repo_id_target, lora_model, policy,
-            model_optimizer, policy_optimizer, scheduler,
-            epoch=epoch + 1, step_in_epoch=0, global_step=global_step, recipe=recipe,
-        )
-        print(f"[{task}] checkpoint saved at end of epoch {epoch} (global step {global_step}).")
-
-    print(f"Pushing learned-reordering model and processor to Hugging Face Hub: {repo_id_target}...")
-    lora_model.push_to_hub(
-        repo_id_target,
-        commit_message=f"Training complete for {task} with learned patch reordering",
-    )
-    processor.push_to_hub(repo_id_target)
-
-    policy_path = Path(output_dir) / "policy.pt"
-    policy_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(policy.state_dict(), policy_path)
-    print(f"Saved learned reordering policy weights to {policy_path}")
-
-    return lora_model, policy, repo_id_target
+def describe_order(order: Optional[list], grid_size: int = 8) -> str:
+    """The order as a board diagram: each square shows its reading step (0 = read first)."""
+    if order is None:
+        order = list(range(grid_size * grid_size))
+    step = {sq: i for i, sq in enumerate(order)}
+    lines = [f"{grid_size - r} " + " ".join(f"{step[r * grid_size + c]:2d}" for c in range(grid_size))
+             for r in range(grid_size)]
+    lines.append("   " + "  ".join("abcdefgh"[:grid_size]))
+    return "\n".join(lines)

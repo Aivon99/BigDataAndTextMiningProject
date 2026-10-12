@@ -1,13 +1,26 @@
-"""Patch reordering strategies for the chessboard images."""
+"""Scan orders over the 64 board squares, plus the legacy pixel-tile reordering."""
 
 import numpy as np
+import torch
 from PIL import Image
+
+# Orders taken from REOrder (external/REOrder), by their name there.
+_REORDER_ORDERS = {"hilbert": "hilbert-curve", "diagonal": "diagonal", "snake_diagonal": "snake"}
 
 
 def get_patch_reordering_indices(strategy="raster", grid_size=8):
-    """Returns the patch order for a strategy: raster, zigzag, spiral,
-    file_wise or rank_wise.
+    """Returns the squares (raster index, 0 = a8, 63 = h1) in the order they are read.
+
+    raster / rank_wise (the same order), file_wise, zigzag, spiral_center_out
+    (the spec's center-out spiral), spiral (outside-in, used by the first runs),
+    and REOrder's hilbert, diagonal and snake_diagonal.
     """
+    if strategy in _REORDER_ORDERS:
+        from training.reorder_lib import reorder_scan_order
+        return reorder_scan_order(_REORDER_ORDERS[strategy], grid_size=grid_size)
+    if strategy == "spiral_center_out":
+        return get_patch_reordering_indices("spiral", grid_size)[::-1]
+
     total_patches = grid_size * grid_size
     indices = np.arange(total_patches).reshape(grid_size, grid_size)
 
@@ -52,8 +65,22 @@ def get_patch_reordering_indices(strategy="raster", grid_size=8):
     else:
         raise ValueError(f"Unknown reordering strategy: {strategy}")
 
+def resolve_square_order(order, grid_size=8):
+    """Strategy name or square permutation -> list of squares, or None for raster."""
+    if order is None:
+        return None
+    if isinstance(order, str):
+        order = get_patch_reordering_indices(order, grid_size=grid_size)
+    order = [int(i) for i in (order.tolist() if torch.is_tensor(order) else order)]
+    return None if order == list(range(grid_size * grid_size)) else order
+
+
 def apply_patch_permutation(image, permutation, grid_size=8, img_size=512):
-    """Cuts the image into a grid of tiles and puts them back in the given order."""
+    """LEGACY: cuts the image into tiles and puts them back in the given order.
+
+    This moves pieces to other squares, so it changes the board itself; the
+    experiments now reorder the tokens instead (training/token_reordering.py).
+    """
     image = image.resize((img_size, img_size))
     tile_size = img_size // grid_size
 
@@ -75,6 +102,6 @@ def apply_patch_permutation(image, permutation, grid_size=8, img_size=512):
 
 
 def reorder_chessboard_image(image, strategy="raster", grid_size=8, img_size=512):
-    """Reorders the tiles of the image with one of the fixed strategies."""
+    """LEGACY: reorders the tiles of the image with one of the fixed strategies."""
     reorder_indices = get_patch_reordering_indices(strategy=strategy, grid_size=grid_size)
     return apply_patch_permutation(image, reorder_indices, grid_size=grid_size, img_size=img_size)

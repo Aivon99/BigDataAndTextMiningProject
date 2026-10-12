@@ -177,6 +177,98 @@ def analyze_fen_predictions(results_df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df, pd.DataFrame(rows)], axis=1)
 
 
+def fen_error_breakdown(results_df: pd.DataFrame, n_examples: int = 5) -> dict:
+    """
+    Qualitative error analysis for Task 1 (board field only, what the image shows):
+      wrong_squares_per_board -- how many of the 64 squares are wrong per prediction
+                                 ("unparseable" if the board field isn't valid FEN)
+      confusions              -- (true -> predicted) piece pairs over all wrong squares,
+                                 '.' = empty square, most frequent first
+      examples                -- a few failed predictions with their wrong squares
+    """
+    import chess
+
+    def board_of(fen):
+        try:
+            return chess.Board(str(fen).split()[0] + " w - - 0 1")
+        except (ValueError, IndexError):
+            return None
+
+    per_board, confusions, examples = [], [], []
+    for gt, pred in zip(results_df["ground_truth"].astype(str), results_df["predicted"].fillna("").astype(str)):
+        g, p = board_of(gt), board_of(pred)
+        if g is None:
+            continue
+        if p is None:
+            per_board.append("unparseable")
+            if len(examples) < n_examples:
+                examples.append({"ground_truth": gt.split()[0], "predicted": pred, "wrong_squares": "unparseable"})
+            continue
+        wrong = []
+        for sq in chess.SQUARES:
+            a, b = g.piece_at(sq), p.piece_at(sq)
+            if a != b:
+                pair = f"{a.symbol() if a else '.'} -> {b.symbol() if b else '.'}"
+                confusions.append(pair)
+                wrong.append(f"{chess.square_name(sq)}: {pair}")
+        per_board.append(len(wrong))
+        if wrong and len(examples) < n_examples:
+            examples.append({"ground_truth": gt.split()[0], "predicted": pred.split()[0], "wrong_squares": ", ".join(wrong)})
+    return {
+        "wrong_squares_per_board": pd.Series(per_board, name="boards").value_counts(),
+        "confusions": pd.Series(confusions, name="count").value_counts(),
+        "examples": pd.DataFrame(examples),
+    }
+
+
+# The spec's metrics (section 4) in display order. Task 1: FEN exact match and
+# CER on the board field, the only part of a FEN the image shows. Task 2/3:
+# Exact Match is em_extracted, the move on the answer line.
+HEADLINE_COLUMNS = {
+    "task1": {
+        "board_exact_match": "FEN Exact Match (board)",
+        "board_character_error_rate": "CER (board)",
+        "square_by_square_accuracy": "Square-by-Square Acc",
+        "fen_exact_match": "FEN EM (full string)",
+        "character_error_rate": "CER (full string)",
+        "levenshtein_distance": "Levenshtein (full string)",
+    },
+    "task2": {
+        "em_extracted": "Exact Match",
+        "same_move": "Same move (any notation)",
+        "legal": "Legal move",
+        "exact_match": "EM raw output",
+    },
+}
+HEADLINE_COLUMNS["task3"] = HEADLINE_COLUMNS["task2"]
+
+
+def experiment_setup(model_name: str) -> str:
+    """Which experimental setup a results row belongs to, from its name tag."""
+    m = re.search(r"\[([^\]]+)\]\s*$", str(model_name))
+    if not m:
+        return "legacy: pixel-tile reordering, 512px"
+    tag = m.group(1)
+    t = re.fullmatch(r"tok(\d+)", tag)
+    return f"token reordering, {t.group(1)}px" if t else tag
+
+
+def headline_table(table: pd.DataFrame, task: str) -> pd.DataFrame:
+    """
+    The comparison table with the spec's metrics first (renamed), a `setup`
+    column (token-level runs vs the legacy pixel-tile runs), best first.
+    """
+    cols = HEADLINE_COLUMNS[task]
+    out = table.copy()
+    out.insert(1, "setup", out["model_name"].map(experiment_setup))
+    keep = ["model_name", "setup"] + [c for c in cols if c in out.columns]
+    out = out[keep].rename(columns=cols)
+    sort_by = next((name for col, name in cols.items() if col in table.columns), None)
+    if sort_by is not None and sort_by.startswith("CER"):
+        return out.sort_values(sort_by).reset_index(drop=True)
+    return (out.sort_values(sort_by, ascending=False) if sort_by else out).reset_index(drop=True)
+
+
 def rescore_cached_fen_results(hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
     """Recomputes the FEN columns for every result file cached on the Hub.
     No GPU needed.

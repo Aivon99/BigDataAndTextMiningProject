@@ -137,12 +137,14 @@ def evaluate_with_cache(
     hf_org_prefix: str = "bdatm-project",
     force: bool = False,
     adapter_repo_id: str | None = None,
+    **eval_kwargs,
 ):
     """Same as evaluate_chessboard_model_task_N, but first looks for a cached
     result on the Hub.
 
     If adapter_repo_id is given, the cached result is used only if the weights
-    have not changed. Use force=True to evaluate again anyway.
+    have not changed. Use force=True to evaluate again anyway. eval_kwargs go
+    to the evaluation function (e.g. few_shot_examples).
     """
     if task not in _EVAL_FUNCS:
         raise ValueError(f"evaluate_with_cache: unknown task '{task}'")
@@ -174,7 +176,7 @@ def evaluate_with_cache(
                 return results_df, summary_df
 
     results_df, summary_df = _EVAL_FUNCS[task](
-        model=model, processor=processor, dataset_split=dataset_split, model_name=model_name
+        model=model, processor=processor, dataset_split=dataset_split, model_name=model_name, **eval_kwargs
     )
     if adapter_sha is not None:
         summary_df["adapter_sha"] = adapter_sha
@@ -195,3 +197,31 @@ def evaluate_with_cache(
     print(f"[{task}] Cached evaluation for '{model_name}' -- pushed to '{repo_id}'.")
 
     return results_df, summary_df
+
+
+def evaluate_with_order(
+    task: str,
+    model,
+    processor,
+    dataset_split,
+    model_name: str,
+    order=None,
+    hf_org_prefix: str = "bdatm-project",
+    adapter_repo_id: str | None = None,
+    force: bool = False,
+    **eval_kwargs,
+):
+    """evaluate_with_cache with the visual tokens read in the given order
+    (strategy name, square permutation, or None for raster). The model's
+    previous order is restored afterwards.
+    """
+    from training.reordering import resolve_square_order
+    from training.token_reordering import install_token_reordering
+
+    reorderer = install_token_reordering(model)
+    with reorderer.order(resolve_square_order(order)):
+        return evaluate_with_cache(
+            task=task, model=model, processor=processor, dataset_split=dataset_split,
+            model_name=model_name, hf_org_prefix=hf_org_prefix, force=force,
+            adapter_repo_id=adapter_repo_id, **eval_kwargs,
+        )
