@@ -39,8 +39,10 @@ From each puzzle we take the starting position and the first move.
 - 20,000 puzzles are sampled from the CSV, then 2,000 with white to move and 2,000 with black
   to move are kept (4,000 in total).
 - The puzzles are split 80/10/10 into train, validation and test (3,200 / 400 / 400).
-- The same puzzles are used for all three tasks. Boards are drawn as 512x512 images without
-  coordinates, so every square lines up with the patch grid of the model.
+- There is one dataset for each task, and all three are built from the same 4,000 puzzles.
+  Only the images and the expected answer change from one task to another.
+- Boards are drawn as 512x512 images without coordinates, so every square lines up with the
+  patch grid of the model.
 
 These numbers can be changed in `configs/config.yaml`. The datasets are already on Hugging Face
 (see the links above).
