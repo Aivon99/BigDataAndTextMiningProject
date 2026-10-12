@@ -1,3 +1,5 @@
+"""Creates the chessboard images and metadata for the three task datasets."""
+
 import io
 import json
 import multiprocessing
@@ -47,12 +49,8 @@ def render_board_svg(
     size: int = 512,
     lastmove: Optional[chess.Move] = None,
 ) -> Image.Image:
-    """Renders a chess.Board state to an RGB PIL Image via SVG rasterization.
-
-    coordinates=False on purpose: with python-chess's default labels the board
-    sits inside a ~20px margin, so squares are ~59px instead of size/8 and no
-    longer line up with the ViT patch grid or the 8x8 tiles used for patch
-    reordering. Without labels the 8x8 squares fill the image exactly.
+    """Draws the board as a PIL image. Coordinates are turned off so the 8x8
+    squares fill the whole image.
     """
     svg_data = chess.svg.board(board=board, size=size, lastmove=lastmove, coordinates=False)
     png_bytes = cairosvg.svg2png(bytestring=svg_data.encode("utf-8"))
@@ -68,7 +66,7 @@ def build_sample(
     output_dir: Optional[Union[str, Path]] = None,
     image_size: int = 512,
 ) -> Dict[str, Union[List[Image.Image], dict]]:
-    """Builds a single multimodal sample for Task 1, Task 2, or Task 3."""
+    """Builds one sample (images, prompt and target) for task1, task2 or task3."""
     if task not in PROMPTS:
         raise ValueError(f"Unsupported task '{task}'. Expected one of: {list(PROMPTS.keys())}")
 
@@ -133,12 +131,6 @@ def build_sample(
 
 
 def _render_sample_to_disk(args: tuple) -> dict:
-    """
-    Worker entry point for `generate_datasets_parallel`. Renders one sample
-    straight to disk via `build_sample` and returns only its metadata dict —
-    never the PIL images — so results stay cheap to ship back from a worker
-    process to the main one over IPC.
-    """
     fen, task, sample_id, moves, puzzle_id, output_dir, image_size = args
     result = build_sample(
         fen=fen,
@@ -152,21 +144,14 @@ def _render_sample_to_disk(args: tuple) -> dict:
     return result["metadata"]
 
 
-# Bump whenever the rendered images change (e.g. board coordinates removed) so
-# `skip_existing` doesn't keep stale images that only *look* up to date.
 RENDER_VERSION = "no-coordinates-v2"
 
 
 def _stamp_path(output_root: Path, task: str, split_name: str) -> Path:
-    # Kept outside dataset_<task>/ so the stamp never gets uploaded to the Hub.
     return output_root / ".render_stamps" / f"{task}_{split_name}"
 
 
 def _existing_sample_count(output_dir: Path) -> int:
-    """
-    Number of samples already recorded in `output_dir/metadata.jsonl`, or 0
-    if that file doesn't exist yet.
-    """
     metadata_path = output_dir / "metadata.jsonl"
     if not metadata_path.exists():
         return 0
@@ -181,27 +166,16 @@ def generate_datasets_parallel(
     num_workers: Optional[int] = None,
     skip_existing: bool = True,
 ) -> None:
-    """
-    Generates every (task, split) dataset in `task_splits` using a single
-    pool of worker processes, instead of looping over tasks and splits one
-    at a time. Each worker renders one sample directly to disk; the
-    per-(task, split) `metadata.jsonl` files are written once, from the main
-    process, after the whole pool has finished.
+    """Generates all the task/split datasets in parallel and writes a
+    metadata.jsonl file for each one.
 
-    `task_splits` is a mapping like {"task1": {"train": df, ...}, "task2": ...}.
-    The same `splits` dict can be reused for every task, since a given puzzle
-    row is independent across tasks.
-
-    If `skip_existing` is True (the default), a (task, split) combination is
-    skipped entirely when its output folder already has a `metadata.jsonl`
-    with exactly as many records as `split_df` has rows — so re-running this
-    after an interruption (a kernel restart, a network blip mid-upload, ...)
-    doesn't re-render work that's already on disk.
+    If skip_existing is True, a split that is already complete on disk is
+    skipped.
     """
     output_root = Path(output_root)
 
     work_items: List[tuple] = []
-    job_dirs: List[Path] = []  # parallel to work_items: output_dir for each item
+    job_dirs: List[Path] = []
 
     for task, splits in task_splits.items():
         for split_name, split_df in splits.items():

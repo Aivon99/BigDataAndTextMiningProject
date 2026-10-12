@@ -1,3 +1,5 @@
+"""Helpers to load the config file and the Lichess puzzle CSV."""
+
 from pathlib import Path
 
 import yaml
@@ -5,9 +7,6 @@ import pandas as pd
 
 
 def load_config(config_path: str | Path = "configs/config.yaml") -> dict:
-    """
-    Load the project's YAML config (dataset generation sizes, HF namespace, ...).
-    """
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -17,11 +16,7 @@ def load_lichess_csv(
     max_samples: int = None,
     seed: int = 42
 ):
-    """
-    Load Lichess puzzle CSV. If `max_samples` exceeds the number of rows
-    actually available, it's clamped down to that count (with a warning)
-    instead of letting pandas raise on `.sample(n=...)`.
-    """
+    """Loads the Lichess CSV and takes a random sample of max_samples rows."""
 
     df = pd.read_csv(csv_path)
 
@@ -46,13 +41,7 @@ def clamp_balanced_turn_counts(
     n_per_turn: int,
     turn_col: str = "turn",
 ) -> int:
-    """
-    Clamp `n_per_turn` down to whatever is actually available for the
-    scarcer of the two turns ('w'/'b') in `df`, so a subsequent
-    `.sample(n=n_per_turn)` per turn never overflows the population.
-    Prints a warning and returns the reduced value if clamping was needed;
-    otherwise returns `n_per_turn` unchanged.
-    """
+    """Lowers n_per_turn if there are not enough white or black puzzles."""
     available_white = int((df[turn_col] == "w").sum())
     available_black = int((df[turn_col] == "b").sum())
     max_possible = min(available_white, available_black)

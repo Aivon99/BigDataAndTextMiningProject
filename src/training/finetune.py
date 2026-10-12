@@ -1,3 +1,7 @@
+"""Fine-tunes the model with LoRA for one task and one reordering strategy,
+then pushes it to the Hub.
+"""
+
 from transformers import (
     EarlyStoppingCallback,
     Trainer,
@@ -35,27 +39,12 @@ def finetune_and_push_chessboard_model(
     if task not in ("task1", "task2", "task3"):
         raise ValueError(f"Unknown task: {task}")
 
-    # 1-2. Reordering and preprocessing happen on the fly inside the collator
-    # (both frames for task3), so no reordered/tokenized copy of the dataset
-    # is ever materialised on disk.
-
-    # 3. Apply PEFT/LoRA to the provided model instance
     print("Applying LoRA to the provided model...")
     lora_model_instance = get_peft_model(model, peft_config)
 
-    # 4. Resolve the target Hub repo now (needed before training starts) and
-    # check whether an earlier, interrupted run already left a resumable
-    # checkpoint there (e.g. after a Colab disconnect wiped the local runtime).
     repo_id_target = f"{hf_org_prefix}/qwen-{task}-{strategy_name}-lora"
     resume_checkpoint = find_resumable_checkpoint(repo_id_target)
 
-    # 5. Configure Training Arguments for this specific run. Trains for up to
-    # `num_train_epochs`, but relies on the validation set (via
-    # EarlyStoppingCallback below) to stop once eval_loss stops improving,
-    # and to keep the best-performing checkpoint rather than just the last one.
-    # push_to_hub + hub_strategy="checkpoint" uploads a fully resumable
-    # checkpoint (optimizer/scheduler/RNG state included) after every epoch,
-    # so an interruption at epoch i loses at most that epoch's progress.
     training_args_instance = TrainingArguments(
         output_dir=f"./temp_{task}_{strategy_name}_output",
         per_device_train_batch_size=8,
@@ -79,7 +68,6 @@ def finetune_and_push_chessboard_model(
         report_to="none",
     )
 
-    # 6. Initialize Data Collator and Trainer
     data_collator = Qwen35OnTheFlyCollator(processor=processor, strategy=strategy_name)
 
     trainer_instance = Trainer(
@@ -94,7 +82,6 @@ def finetune_and_push_chessboard_model(
         ],
     )
 
-    # 7. Train (or resume) the model
     if resume_checkpoint:
         print(f"Resuming training for {task} ({strategy_name} reordering) from {resume_checkpoint}...")
     else:
@@ -103,7 +90,6 @@ def finetune_and_push_chessboard_model(
         print(f"Nothing new to push for {repo_id_target}.")
         return trainer_instance.model
 
-    # 8. Push final weights and processor directly to Hugging Face Hub
     print(
         f"Pushing model and processor to Hugging Face Hub: {repo_id_target}..."
     )

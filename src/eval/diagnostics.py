@@ -1,37 +1,5 @@
-"""
-Diagnostics for the chessboard tasks -- tools for finding out *why* a model
-scores what it scores, not just what it scores.
-
-Written after Task 3 came back at ~0% exact match for every model (vanilla,
-LoRA, all reorderings, learned reordering). The root cause turned out to be
-the training runs themselves (see `training_health_report`): every Task 3
-run started before the prompt-masking fix in `preprocess_function` and was
-resumed after it, so the objective changed mid-run and only the last few
-epochs actually trained on the answer tokens. None of the existing metrics
-could show that -- a single exact-match number can't tell "almost right"
-from "garbage", and can't tell "didn't learn" from "learned but the eval is
-broken". The functions here can:
-
-- `analyze_san_predictions` / `summarize_san_diagnostics` (Task 2/3): partial
-  credit for move predictions -- is the move legal, is it the *same move*
-  written differently (missing "x" or "+", over/under-disambiguation), are the
-  from/to squares right, is it the right piece. Pure python-chess, no GPU,
-  works on the per-sample CSVs already cached on the Hub.
-- `training_health_report`: reads `trainer_state.json` of a Trainer run
-  from the Hub and flags eval-loss discontinuities (the signature of an
-  objective change across a resume) and missing/mismatched training-recipe
-  markers.
-- `supervised_tokens_preview`: decodes exactly which tokens carry loss for
-  one training sample -- a sanity check of the label mask.
-- `frame_ablation_losses` (Task 3): teacher-forced answer loss with the two
-  frames correct / swapped / duplicated. If the model actually compares the
-  frames, the correct pairing must have clearly lower loss; if all
-  conditions tie, the model is ignoring (at least) one frame.
-- `save_diagnostics`: writes any DataFrame to Google Drive when it's mounted
-  (Colab), else to a local folder, so diagnostics survive a runtime reset.
-
-torch/transformers are imported lazily inside the GPU functions, so the
-chess-level analysis can run on a laptop without a working ML stack.
+"""Extra analysis of the model outputs, used to understand the errors and to
+check the training runs.
 """
 
 import json
@@ -43,21 +11,13 @@ from typing import Iterable, Optional
 import chess
 import pandas as pd
 
-# A SAN move anywhere in a string: castling, or [piece][disambiguation][x]square[=promo][+#].
 _SAN_RE = re.compile(
     r"(O-O-O|O-O|0-0-0|0-0|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=?[QRBN])?)[+#]?"
 )
 
 
 def extract_san(text: str) -> str:
-    """
-    Best-effort SAN extraction from a model reply: looks at the first
-    non-empty line only (a fine-tuned model answers there; later lines are
-    repetition or reasoning, where a stray square mention would be a false
-    positive -- the concern noted in `evaluate_chessboard_model_task_2`),
-    and returns the first SAN-shaped token on it, or the stripped line if
-    there is none.
-    """
+    """Takes the SAN move from the first line of the model output."""
     if not isinstance(text, str):
         return ""
     first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
@@ -79,12 +39,6 @@ _PIECES = {"K": chess.KING, "Q": chess.QUEEN, "R": chess.ROOK, "B": chess.BISHOP
 
 
 def _ambiguous_candidates(board: chess.Board, san: str) -> list:
-    """
-    Legal moves an under-disambiguated SAN could mean ("Rc8" when both rooks
-    can reach c8). python-chess refuses to parse such SAN; the model,
-    though, has identified piece and destination -- and in Task 2 the
-    origin square is highlighted -- so it's a notation slip, not a wrong move.
-    """
     m = _SAN_PARTS_RE.match(san)
     if not m:
         return []
@@ -103,33 +57,13 @@ def _ambiguous_candidates(board: chess.Board, san: str) -> list:
 
 
 def analyze_san_predictions(results_df: pd.DataFrame, fens: Iterable[str]) -> pd.DataFrame:
-    """
-    Adds move-level diagnostic columns to a Task 2/3 per-sample results frame.
+    """Adds move level columns (legal move, same move, right squares, right
+    piece) to the Task 2/3 results.
 
-    `fens` must be the dataset's `fen` column in the same row order as
-    `results_df` -- it is the position *before* the move (checked: every
-    ground-truth target is legal in it), so a prediction can be replayed on
-    the real board.
-
-    Added columns:
-      pred_san        -- `extract_san(raw_output)`
-      em_extracted    -- exact match after extraction (fixes chatty/repeating output)
-      multiline       -- the model kept generating after its answer
-      legal           -- pred_san denotes a legal move in the position (an
-                         under-disambiguated SAN counts if some legal move fits it)
-      ambiguous       -- pred_san is under-disambiguated ("Rc8" with two rooks able to go)
-      same_move       -- pred_san is the ground-truth move, however it was written
-                         (e.g. "Be4" for "Bxe4", "Nf5" for "Nf5+", "Rc8" for "Rac8"
-                         -- ambiguous SAN counts if the true move is one of its readings)
-      from_sq_match / to_sq_match / piece_match -- partial credit, legal moves only
-
-    Most strict-EM misses of the fine-tuned Task 2 model are notation, not
-    perception: a missing/extra capture "x" (the post-move image doesn't show
-    whether a piece was taken), a missing "+", or missing disambiguation.
+    fens must be the fen column of the dataset, in the same order as
+    results_df.
     """
     df = results_df.copy().reset_index(drop=True)
-    # Re-analysing a CSV that already has these columns (any evaluation since
-    # they were added) must replace them, not duplicate them.
     df = df.drop(columns=[c for c in ["pred_san", *SAN_DIAGNOSTIC_COLUMNS] if c in df.columns])
     fens = list(fens)
     if len(fens) != len(df):
@@ -147,7 +81,6 @@ def analyze_san_predictions(results_df: pd.DataFrame, fens: Iterable[str]) -> pd
             candidates = _ambiguous_candidates(board, pred)
             if len(candidates) > 1:
                 ambiguous = True
-                # credit the true move if it's one of the readings, else any reading
                 pred_move = gt_move if gt_move in candidates else candidates[0]
         legal = pred_move is not None
         rows.append({
@@ -173,7 +106,6 @@ SAN_DIAGNOSTIC_COLUMNS = [
 
 
 def summarize_san_diagnostics(analyzed_df: pd.DataFrame, model_name: Optional[str] = None) -> pd.DataFrame:
-    """One-row summary (means) of `analyze_san_predictions` output, plus strict EM if present."""
     summary = {"model_name": model_name} if model_name else {}
     if "exact_match" in analyzed_df.columns:
         summary["exact_match"] = analyzed_df["exact_match"].mean()
@@ -183,10 +115,7 @@ def summarize_san_diagnostics(analyzed_df: pd.DataFrame, model_name: Optional[st
 
 
 def san_error_breakdown(analyzed_df: pd.DataFrame) -> pd.Series:
-    """
-    Buckets every prediction into one failure mode, most-correct first --
-    the table the qualitative error analysis needs.
-    """
+    """Counts how many predictions fall into each type of error."""
     def bucket(r):
         if r["em_extracted"]:
             return "exact"
@@ -206,10 +135,6 @@ def san_error_breakdown(analyzed_df: pd.DataFrame) -> pd.Series:
     return analyzed_df.apply(bucket, axis=1).value_counts()
 
 
-# ---------------------------------------------------------------------------
-# Task 1: FEN field-level analysis
-# ---------------------------------------------------------------------------
-
 FEN_DIAGNOSTIC_COLUMNS = [
     "board_exact_match", "board_character_error_rate",
     "side_to_move_match", "castling_match", "en_passant_match", "clocks_match",
@@ -220,7 +145,7 @@ def _levenshtein(a: str, b: str) -> int:
     try:
         import Levenshtein
         return Levenshtein.distance(a, b)
-    except ImportError:  # small pure-python fallback, FEN strings are short
+    except ImportError:
         prev = list(range(len(b) + 1))
         for i, ca in enumerate(a, 1):
             cur = [i]
@@ -231,21 +156,8 @@ def _levenshtein(a: str, b: str) -> int:
 
 
 def analyze_fen_predictions(results_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds per-field columns to a Task 1 per-sample results frame.
-
-    A FEN has six fields, and only the first is fully visible in the image:
-    the board is always drawn from White's side with no turn marker, and the
-    halfmove clock / fullmove number can't be seen at all. Full-FEN exact
-    match therefore measures guessing as much as perception (Task 1 after
-    retraining: 98.8% of boards exactly right, 0.8% full-FEN exact match;
-    the model outputs halfmove "0" for 99% of samples). The board fields are
-    the perception metric; the others are reported separately.
-
-      board_exact_match           -- piece placement (field 1) identical
-      board_character_error_rate  -- CER on field 1 only
-      side_to_move_match / castling_match / en_passant_match -- fields 2-4
-      clocks_match                -- fields 5-6 (halfmove, fullmove) both right
+    """Adds one column per FEN field to the Task 1 results. Only the board part
+    can really be seen in the image.
     """
     df = results_df.copy().reset_index(drop=True)
     df = df.drop(columns=[c for c in FEN_DIAGNOSTIC_COLUMNS if c in df.columns])
@@ -266,10 +178,8 @@ def analyze_fen_predictions(results_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def rescore_cached_fen_results(hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
-    """
-    Task 1 counterpart of `rescore_cached_san_results`: per-field FEN metrics
-    for every per-sample CSV cached on the Hub, no GPU. One row per model,
-    best `board_exact_match` first.
+    """Recomputes the FEN columns for every result file cached on the Hub.
+    No GPU needed.
     """
     from huggingface_hub import HfApi, hf_hub_download
 
@@ -290,13 +200,8 @@ def rescore_cached_fen_results(hf_org_prefix: str = "bdatm-project") -> pd.DataF
 
 
 def rescore_cached_san_results(task: str, fens: Iterable[str], hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
-    """
-    Re-scores every per-sample CSV cached under
-    `{hf_org_prefix}/evaluation-results-{task}/per_sample/` with the move-level
-    diagnostics -- no GPU, no re-inference. `fens` is the test split's `fen`
-    column (same order the CSVs were written in). Returns one row per cached
-    model, best `same_move` first. Models evaluated before per-sample caching
-    existed have no CSV and are simply absent.
+    """Recomputes the move columns for every result file cached on the Hub.
+    No GPU needed.
     """
     from huggingface_hub import HfApi, hf_hub_download
 
@@ -320,22 +225,8 @@ def backfill_cached_metrics(
     hf_org_prefix: str = "bdatm-project",
     drop_models: Iterable[str] = (),
 ) -> pd.DataFrame:
-    """
-    Recomputes the diagnostic columns (FEN_DIAGNOSTIC_COLUMNS for task1,
-    SAN_DIAGNOSTIC_COLUMNS for task2/3) of a model-comparison table from the
-    per-sample CSVs cached on the Hub -- no inference.
-
-    Rows evaluated before those columns existed otherwise show NaN next to
-    rows evaluated after, and rows evaluated under an older version of a
-    metric (e.g. before ambiguous SAN was credited) would mix definitions.
-    The per-sample predictions are the source of truth, so every row with a
-    CSV gets all its diagnostic columns recomputed with the current code;
-    strict metrics (exact_match, CER, ...) are left as they are. A row is
-    matched to `per_sample/<slug>.csv` with the same slug
-    `evaluate_with_cache` writes; rows without a CSV (evaluated before
-    per-sample caching) keep whatever they have. Rows named in `drop_models` are
-    removed (e.g. stale results of a broken run). `fens` (the test split's
-    `fen` column) is required for task2/task3.
+    """Recomputes the diagnostic columns of the results table from the
+    per-sample files on the Hub. Models in drop_models are removed.
     """
     from huggingface_hub import HfApi, hf_hub_download
 
@@ -371,33 +262,9 @@ def backfill_cached_metrics(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Training-run health
-# ---------------------------------------------------------------------------
-
 def training_health_report(repo_id: str, jump_threshold: float = 0.4, verbose: bool = True) -> dict:
-    """
-    Inspects a Trainer run pushed with `hub_strategy="checkpoint"`: eval loss
-    per epoch, the train loss at start/end, and whether the run carries a
-    training-recipe marker matching the current code
-    (`training.checkpoints.TRAINING_RECIPE`).
-
-    Flags an epoch-to-epoch eval-loss change larger than `jump_threshold`
-    (relative) that comes right after a plateau (previous change < 10%).
-    Healthy runs drop steeply in the first epochs and then flatten; a step
-    *after* flattening (Task 3: 2.76 -> 0.75 in one epoch, at a different
-    epoch in every run) means the loss itself was redefined partway through
-    -- e.g. a code change picked up on resume -- so best-checkpoint
-    selection and early stopping across that point compared incomparable
-    numbers.
-
-    Also reports the best vs the last evaluated epoch, and whether the best
-    epoch's adapter is on the Hub (`best-checkpoint/`, written by
-    HubBestAdapterCallback): a run resumed in a new session before that
-    callback existed published its last epoch, not its best.
-
-    Learned-reordering repos (custom loop, no Trainer state) report their
-    checkpoint metadata and recipe instead.
+    """Reads the training logs of a run from the Hub and flags sudden jumps in
+    the eval loss.
     """
     from huggingface_hub import HfApi, hf_hub_download
 
@@ -467,16 +334,8 @@ def training_health_report(repo_id: str, jump_threshold: float = 0.4, verbose: b
     return report
 
 
-# ---------------------------------------------------------------------------
-# Label mask + frame-ablation (GPU helpers, lazy imports)
-# ---------------------------------------------------------------------------
-
 def supervised_tokens_preview(sample: dict, processor) -> str:
-    """
-    Runs `preprocess_function` on one raw dataset row and decodes only the
-    tokens whose label != -100 -- i.e. exactly what the loss is computed on.
-    Expected for Task 2/3: "<think>\\n\\n</think>\\n\\n<MOVE><|im_end|>\\n".
-    """
+    """Shows the tokens of one sample that are used in the loss."""
     from training.preprocessing import preprocess_function
 
     processed = preprocess_function(sample, processor)
@@ -488,12 +347,6 @@ def supervised_tokens_preview(sample: dict, processor) -> str:
 
 
 def _split_frame_patches(pixel_values, image_grid_thw):
-    """
-    Splits the processor's flattened `pixel_values` of a two-image sample into
-    (frame 1 patches, frame 2 patches), using `image_grid_thw` (rows per image
-    = t*h*w). Returns None unless both frames have the same patch grid -- the
-    only case where frames can be swapped without changing the token sequence.
-    """
     sizes = [int(n) for n in image_grid_thw.prod(dim=-1).tolist()]
     if len(sizes) != 2 or sizes[0] != sizes[1] or pixel_values.shape[0] != sum(sizes):
         return None
@@ -501,27 +354,9 @@ def _split_frame_patches(pixel_values, image_grid_thw):
 
 
 def frame_ablation_losses(model, processor, dataset_split, n_samples: int = 50) -> pd.DataFrame:
-    """
-    Task 3: teacher-forced answer loss under four frame conditions, per sample:
-
-      correct  -- (t, t+1), what the model is trained on
-      swapped  -- (t+1, t): the "move" would run backwards
-      both_t   -- (t, t):   no change visible at all
-      both_t1  -- (t+1, t+1)
-
-    A model that reads both frames must do clearly better on `correct` than
-    on every other condition. Near-equal losses mean it answers from one
-    frame (or from the prior over common moves) and never learned to diff.
-    Note the loss also covers the trivially-predictable
-    "<think></think>" / "<|im_end|>" tokens, so differences are diluted --
-    compare conditions, not absolute values.
-
-    Each sample is preprocessed once, with `preprocess_function` (the
-    training path, so tokens and labels are exactly what the model was
-    trained on). Both frames are 512px, so all four conditions share the same
-    token sequence and differ only in the order of the two frames' image
-    patches -- the conditions are built by reordering those, not by
-    re-running the (CPU-bound) image processor four times.
+    """Task 3 check: compares the loss with the two frames in the right order,
+    swapped or repeated. If the model really uses both frames, the right
+    order should have the lowest loss.
     """
     import torch
     from tqdm.auto import tqdm
@@ -564,19 +399,12 @@ def frame_ablation_losses(model, processor, dataset_split, n_samples: int = 50) 
     return df
 
 
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
 DRIVE_ROOT = "/content/drive/MyDrive/bdatm_diagnostics"
 
 
 def save_diagnostics(df: pd.DataFrame, name: str, task: str, local_root: str = "./diagnostics") -> Path:
-    """
-    Saves `df` as CSV under `<root>/<task>/<name>.csv`, where root is Google
-    Drive (`DRIVE_ROOT`) if Drive is mounted in this Colab runtime, else
-    `local_root`. Drive survives a Colab runtime reset; the local folder does not.
-    Mount Drive first with `from google.colab import drive; drive.mount('/content/drive')`.
+    """Saves a DataFrame as CSV, on Google Drive if it is mounted, otherwise in
+    a local folder.
     """
     root = Path(DRIVE_ROOT) if os.path.isdir("/content/drive/MyDrive") else Path(local_root)
     out = root / task / f"{re.sub(r'[^A-Za-z0-9_.+-]+', '_', name)}.csv"

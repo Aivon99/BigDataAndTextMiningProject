@@ -1,11 +1,12 @@
+"""Patch reordering strategies for the chessboard images."""
+
 import numpy as np
 from PIL import Image
 
 
 def get_patch_reordering_indices(strategy="raster", grid_size=8):
-    """
-    Generates patch reordering index maps for an 8x8 chessboard grid.
-    Strategies supported: 'raster', 'zigzag', 'spiral', 'file_wise', 'rank_wise'
+    """Returns the patch order for a strategy: raster, zigzag, spiral,
+    file_wise or rank_wise.
     """
     total_patches = grid_size * grid_size
     indices = np.arange(total_patches).reshape(grid_size, grid_size)
@@ -42,41 +43,28 @@ def get_patch_reordering_indices(strategy="raster", grid_size=8):
                 left += 1
         return [int(x) for x in reordered]
 
-    elif strategy == "file_wise": # Column-wise
+    elif strategy == "file_wise":
         return [int(x) for x in indices.T.flatten()]
 
-    elif strategy == "rank_wise": # Row-wise (same as raster)
+    elif strategy == "rank_wise":
         return [int(x) for x in indices.flatten()]
 
     else:
         raise ValueError(f"Unknown reordering strategy: {strategy}")
 
 def apply_patch_permutation(image, permutation, grid_size=8, img_size=512):
-    """
-    Slices `image` into a grid_size x grid_size grid of tiles and rearranges
-    them according to `permutation` (a length grid_size**2 sequence of tile
-    indices in raster order, e.g. from `get_patch_reordering_indices()` or
-    sampled from a learned policy such as `PlackettLucePatchPolicy`).
-
-    This is the low-level primitive both `reorder_chessboard_image` (fixed,
-    named strategies) and the learned-reordering training loop
-    (`src/training/learned_reordering.py`, a different permutation per step)
-    build on.
-    """
+    """Cuts the image into a grid of tiles and puts them back in the given order."""
     image = image.resize((img_size, img_size))
     tile_size = img_size // grid_size
 
-    # 1. Split image into individual square tiles
     tiles = []
     for r in range(grid_size):
         for c in range(grid_size):
             box = (c * tile_size, r * tile_size, (c + 1) * tile_size, (r + 1) * tile_size)
             tiles.append(image.crop(box))
 
-    # 2. Rearrange tiles based on the given permutation
     reordered_tiles = [tiles[int(i)] for i in permutation]
 
-    # 3. Stitch tiles back together into a new image
     new_image = Image.new("RGB", (img_size, img_size))
     for idx, tile in enumerate(reordered_tiles):
         r = idx // grid_size
@@ -87,10 +75,6 @@ def apply_patch_permutation(image, permutation, grid_size=8, img_size=512):
 
 
 def reorder_chessboard_image(image, strategy="raster", grid_size=8, img_size=512):
-    """
-    Slices a chessboard PIL Image into an 8x8 grid of tiles and rearranges
-    them according to one of the fixed, named strategies from
-    `get_patch_reordering_indices()`.
-    """
+    """Reorders the tiles of the image with one of the fixed strategies."""
     reorder_indices = get_patch_reordering_indices(strategy=strategy, grid_size=grid_size)
     return apply_patch_permutation(image, reorder_indices, grid_size=grid_size, img_size=img_size)

@@ -1,46 +1,5 @@
-"""
-Learned Reordering (project spec, REOrder methodology section) -- DRAFT.
-
-A lightweight ranking module (`PlackettLucePatchPolicy`) that learns which
-8x8 patch-serialization order helps the VLM most, trained jointly with LoRA
-fine-tuning. Follows the Plackett-Luce / Gumbel-top-k sampling approach from
-the REOrder paper (NeurIPS 2025; see external/REOrder/src/models/layers/plackett_luce.py
-for the reference implementation this is adapted from), but reworked for a
-*pretrained* VLM (Qwen2.5-VL) instead of REOrder's from-scratch classifiers:
-
-- REOrder can reach directly into its own models' patch-embedding sequence,
-  so the permutation can (in principle) sit on a path that's part of the
-  model's forward pass. This project has no such hook into Qwen's vision
-  tower -- reordering happens *before* the model ever sees the image, as a
-  literal pixel-tile rearrangement (`apply_patch_permutation` in
-  `src/training/reordering.py`). That rearrangement is discrete/non-differentiable,
-  which is exactly why the policy is trained via REINFORCE (policy gradient)
-  rather than backprop, same as REOrder's own approach.
-- The reward is the (negative) language-modeling loss on the target FEN/SAN
-  tokens, since there's no classification loss/accuracy here -- this is a
-  generation task, not classification like REOrder's ImageNet/fMoW setup.
-
-This intentionally does NOT use `transformers.Trainer`: a different
-permutation is sampled every step, so images have to be reordered and
-preprocessed on the fly per batch rather than precomputed once into a
-static dataset (which is how `finetune_and_push_chessboard_model`'s
-training-free strategies work). Kept deliberately simple for a first pass:
-single sample per forward pass (mirrors this project's existing
-`per_device_train_batch_size=1` pattern, since the VLM is already large),
-no gradient accumulation, single-GPU, no mixed-precision scaler. Treat this
-as a starting point to profile and iterate on, not a finished, tuned
-training pipeline.
-
-Checkpointing: since this doesn't use `Trainer`, it has none of
-`hub_strategy="checkpoint"`'s built-in resumability -- an interrupted run
-used to lose everything back to epoch 0, step 0. `train_with_learned_reordering`
-now saves a checkpoint (LoRA adapter, policy weights + running baseline,
-both optimizers, the LR scheduler, and the current epoch/step) to the Hub
-every `checkpoint_every_steps` steps and at the end of every epoch, and
-resumes from it automatically if one exists -- mirroring the granularity of
-`find_resumable_checkpoint`'s per-epoch Trainer checkpoints, but finer
-(step-level, since one epoch here can take much longer than in the
-`Trainer`-based cells).
+"""Learned patch reordering: a small policy learns which patch order works
+best while LoRA trains the model. Based on the REOrder paper.
 """
 
 import json
@@ -60,9 +19,6 @@ from training.reordering import apply_patch_permutation
 
 _CHECKPOINT_SUBDIR = "last-learned-checkpoint"
 
-# Default logit gap between consecutive raster positions at init (see
-# PlackettLucePatchPolicy). Part of the checkpoint recipe: a checkpoint
-# trained with a different init/recipe is not resumed.
 DEFAULT_INIT_SPACING = 2.0
 
 
@@ -76,23 +32,8 @@ def _sample_gumbel(shape, device, eps=1e-8):
 
 
 class PlackettLucePatchPolicy(nn.Module):
-    """
-    Learns a soft ranking over the grid_size x grid_size chessboard patches.
-
-    Holds one learnable logit per patch position, initialized to raster
-    order with a gap of `init_spacing` between consecutive positions.
-    `sample()` draws a permutation via Gumbel-top-k sampling from the
-    induced Plackett-Luce distribution, and returns both the permutation
-    and its log-probability (needed for the REINFORCE loss).
-
-    The gap matters: two positions swap with probability ~1/(1+e^gap)
-    under Gumbel noise. The first version used linspace(0, -1) -- a gap of
-    1/63, i.e. every sampled permutation was an essentially uniform random
-    shuffle of the 64 tiles. LoRA was then trained on scrambled boards (the
-    Task 2 learned model: 8% move accuracy vs 95% for raster) and the
-    "learned" greedy order was noise. A gap of 2.0 gives ~12% adjacent
-    swaps and rare long-range ones: exploration around raster, which the
-    policy can then move away from if the reward says so.
+    """Learns a ranking of the board patches and samples patch orders from it.
+    init_spacing sets how close the samples stay to raster order at the start.
     """
 
     def __init__(self, grid_size: int = 8, baseline_momentum: float = 0.9, init_spacing: float = DEFAULT_INIT_SPACING):
@@ -106,11 +47,7 @@ class PlackettLucePatchPolicy(nn.Module):
         self.temperature = 1.0
 
     def sample(self, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            permutation: LongTensor [batch_size, num_patches]
-            log_prob: FloatTensor [batch_size] -- log pi(permutation)
-        """
+        """Returns a batch of permutations and their log probabilities."""
         logits = self.logits.unsqueeze(0)
         g = _sample_gumbel((batch_size, self.num_patches), device=logits.device)
         z = logits + self.temperature * g
@@ -118,7 +55,6 @@ class PlackettLucePatchPolicy(nn.Module):
         sorted_indices = torch.argsort(z, dim=-1, descending=True)
         logits_sorted = torch.gather(logits.expand(batch_size, -1), dim=1, index=sorted_indices)
 
-        # Single-pass Plackett-Luce log-probability of the sampled ranking
         log_cumsums_rev = torch.logcumsumexp(torch.flip(logits_sorted, dims=[-1]), dim=-1)
         log_denominators = torch.flip(log_cumsums_rev, dims=[-1])
         log_prob = (logits_sorted - log_denominators).sum(dim=-1)
@@ -126,16 +62,10 @@ class PlackettLucePatchPolicy(nn.Module):
         return sorted_indices, log_prob
 
     def greedy_permutation(self) -> list:
-        """
-        The policy's single best-guess ordering (argsort of the learned
-        logits, no sampling noise) -- what to actually use at evaluation
-        time, since training samples stochastically but eval needs one fixed
-        ordering to reorder the test set with.
-        """
+        """Best patch order according to the policy, used at evaluation time."""
         return torch.argsort(self.logits, descending=True).tolist()
 
     def update_baseline(self, reward: torch.Tensor) -> None:
-        """Exponential-moving-average baseline for REINFORCE variance reduction."""
         with torch.no_grad():
             self.running_baseline.copy_(
                 self.running_baseline * self.baseline_momentum
@@ -143,7 +73,6 @@ class PlackettLucePatchPolicy(nn.Module):
             )
 
     def reinforce_loss(self, reward: torch.Tensor, log_prob: torch.Tensor) -> torch.Tensor:
-        """-(advantage * log pi(permutation)), averaged over the batch."""
         advantage = reward.detach() - self.running_baseline
         return -(advantage * log_prob).mean()
 
@@ -161,13 +90,6 @@ def _save_learned_reordering_checkpoint(
     global_step: int,
     recipe: str,
 ) -> None:
-    """
-    Saves everything needed to resume mid-run (adapter weights, policy state
-    -- including its running REINFORCE baseline, both optimizers, the LR
-    scheduler, and the exact epoch/step) locally, then pushes it to
-    `repo_id` on the Hub under `last-learned-checkpoint/`. Overwrites the
-    previous checkpoint each time -- only the latest is ever needed.
-    """
     ckpt_dir = local_dir / _CHECKPOINT_SUBDIR
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -191,13 +113,8 @@ def _save_learned_reordering_checkpoint(
 
 
 def find_resumable_learned_reordering_checkpoint(repo_id: str, recipe: Optional[str] = None) -> Optional[Tuple[Path, dict]]:
-    """
-    Mirrors `training.checkpoints.find_resumable_checkpoint`, but for the
-    `last-learned-checkpoint/` folder this module's own checkpointing writes
-    (a `transformers.Trainer` checkpoint and this one are not interchangeable
-    -- different files, different loading code). Returns
-    (local_checkpoint_dir, metadata_dict) or None if there's nothing to
-    resume, so training starts fresh.
+    """Like find_resumable_checkpoint, but for the checkpoints of the learned
+    reordering loop.
     """
     try:
         api = HfApi()
@@ -245,27 +162,11 @@ def train_with_learned_reordering(
     checkpoint_every_steps: int = 200,
     init_spacing: float = DEFAULT_INIT_SPACING,
 ):
-    """
-    Jointly trains LoRA adapters on `model` and a `PlackettLucePatchPolicy`
-    that learns which patch order helps it most, via REINFORCE using the
-    per-sample LM loss as the (negative) reward.
+    """Trains LoRA and the reordering policy together with REINFORCE, using the
+    loss as reward.
 
-    `dataset` is a `datasets.DatasetDict` with the same schema as the other
-    task datasets (raw, un-reordered `image`/`image_t1`/`prompt`/`target`
-    columns -- reordering happens here, per step, not precomputed). For
-    `task="task3"` the same sampled permutation is applied independently to
-    both `image` and `image_t1`, mirroring how `finetune_and_push_chessboard_model`
-    reorders both frames of a dual-image sample with the same fixed strategy.
-
-    Resumable: a checkpoint is pushed to `{hf_org_prefix}/qwen-{task}-learned-
-    reordering-lora` every `checkpoint_every_steps` steps and at the end of
-    every epoch. If that repo already has one (e.g. a previous call to this
-    function was interrupted), training picks up from the exact epoch/step it
-    left off at instead of restarting from scratch. The dataset is iterated
-    in a fixed, unshuffled order (`train_split` as given), which is what
-    makes resuming to the same position deterministic and correct.
-
-    Returns (lora_model, policy, repo_id_target).
+    A checkpoint is pushed to the Hub during training, so an interrupted run
+    resumes where it stopped. Returns (lora_model, policy, repo_id_target).
     """
     if task not in ("task1", "task2", "task3"):
         raise ValueError(f"train_with_learned_reordering: unknown task '{task}'")
@@ -311,10 +212,6 @@ def train_with_learned_reordering(
 
     local_output_dir = Path(output_dir)
 
-    # These fields carry a real leading batch dimension already (as produced by
-    # `processor(..., return_tensors="pt")` for a batch of 1) and must NOT be
-    # unsqueezed again; only the plain-sequence fields do. Mirrors the
-    # distinction `Qwen35VisionDataCollator` makes (cat vs pad_sequence).
     NO_UNSQUEEZE_KEYS = {"pixel_values", "image_grid_thw"}
 
     for epoch in range(start_epoch, num_train_epochs):
@@ -359,7 +256,6 @@ def train_with_learned_reordering(
             model_optimizer.step()
             scheduler.step()
 
-            # Reward: lower LM loss (better prediction under this ordering) -> higher reward
             reward = -lm_loss.detach().unsqueeze(0)
             policy.update_baseline(reward)
             policy_loss = policy_weight * policy.reinforce_loss(reward, log_prob)
@@ -384,9 +280,6 @@ def train_with_learned_reordering(
                 )
                 print(f"[{task}] checkpoint saved at epoch {epoch}, step {row_idx + 1} (global step {global_step}).")
 
-        # End-of-epoch checkpoint too, so a disconnect right after an epoch
-        # boundary (but before the next step_in_epoch%checkpoint_every_steps
-        # hit) still resumes at the epoch it actually reached.
         _save_learned_reordering_checkpoint(
             local_output_dir, repo_id_target, lora_model, policy,
             model_optimizer, policy_optimizer, scheduler,
