@@ -1,103 +1,61 @@
-from typing import List, Optional
+"""Metrics used to score the FEN and SAN predictions."""
 
+import Levenshtein
 import chess
+import re
 
 
-def levenshtein_distance(a: str, b: str) -> int:
+_FEN_RE = re.compile(
+    r"(?:[pnbrqkPNBRQK1-8]+/){7}[pnbrqkPNBRQK1-8]+"
+    r"(?: +[wb] +(?:-|[KQkq]+) +(?:-|[a-h][36]) +[0-9]+ +[0-9]+)?"
+)
+
+
+def extract_fen(text: str) -> str:
+    """Returns the first FEN found in the model output, or the whole output if
+    there is none.
     """
-    Classic edit-distance DP. Pure Python is fine here: FEN/SAN strings are
-    short (well under 100 chars), so no need for a compiled dependency.
+    match = _FEN_RE.search(text)
+    return match.group(0).strip() if match else text.strip()
+
+
+def calculate_fen_exact_match(predicted_fen: str, ground_truth_fen: str) -> float:
+    return 1.0 if predicted_fen.strip() == ground_truth_fen.strip() else 0.0
+
+
+def calculate_levenshtein_metrics(predicted_fen: str, ground_truth_fen: str) -> dict:
+    pred = predicted_fen.strip()
+    gt = ground_truth_fen.strip()
+
+    dist = Levenshtein.distance(pred, gt)
+    cer = dist / max(len(gt), 1)
+
+    return {
+        "levenshtein_distance": dist,
+        "character_error_rate": cer
+    }
+
+
+def calculate_square_by_square_accuracy(predicted_fen: str, ground_truth_fen: str) -> float:
+    """Share of the 64 squares that match. Returns 0 if the predicted FEN
+    can't be parsed.
     """
-    if a == b:
-        return 0
-    if len(a) == 0:
-        return len(b)
-    if len(b) == 0:
-        return len(a)
-
-    prev_row = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        curr_row = [i] + [0] * len(b)
-        for j, cb in enumerate(b, start=1):
-            cost = 0 if ca == cb else 1
-            curr_row[j] = min(
-                prev_row[j] + 1,      # deletion
-                curr_row[j - 1] + 1,  # insertion
-                prev_row[j - 1] + cost,  # substitution
-            )
-        prev_row = curr_row
-
-    return prev_row[-1]
-
-
-def character_error_rate(pred: str, target: str) -> float:
-    """
-    Levenshtein distance normalized by target length. 0.0 = perfect match.
-    """
-    if len(target) == 0:
-        return 0.0 if len(pred) == 0 else 1.0
-    return levenshtein_distance(pred, target) / len(target)
-
-
-def _fen_placement_field(fen: str) -> str:
-    """
-    Isolates the piece-placement field (first field) of a FEN string.
-    """
-    return fen.strip().split(" ")[0]
-
-
-def fen_exact_match(pred_fen: str, target_fen: str, placement_only: bool = True) -> bool:
-    """
-    Compares two FEN strings. Defaults to comparing only the piece-placement
-    field: side-to-move, castling rights, en passant target, halfmove clock,
-    and fullmove number are not visually recoverable from a static board
-    image, so scoring the full 6-field FEN would penalize a model for
-    information it was never shown. Set placement_only=False to require a
-    full-string match instead.
-    """
-    if placement_only:
-        return _fen_placement_field(pred_fen) == _fen_placement_field(target_fen)
-    return pred_fen.strip() == target_fen.strip()
-
-
-def _fen_placement_to_squares(fen: str) -> Optional[List[str]]:
-    """
-    Parses a FEN's piece-placement field into a 64-length list of piece
-    symbols ('.' for empty), ordered a1..h8 (matching `chess.SQUARES`).
-    Returns None if the placement field isn't a well-formed 8x8 layout.
-    """
-    placement = _fen_placement_field(fen)
     try:
-        board = chess.Board(f"{placement} w - - 0 1")
+        pred_board = chess.Board(predicted_fen.strip().split()[0])
+        gt_board = chess.Board(ground_truth_fen.strip().split()[0])
     except ValueError:
-        return None
-    return [
-        (board.piece_at(square).symbol() if board.piece_at(square) else ".")
-        for square in chess.SQUARES
-    ]
-
-
-def square_by_square_accuracy(pred_fen: str, target_fen: str) -> float:
-    """
-    Fraction of the 64 squares where the predicted piece placement matches
-    the target. Returns 0.0 if the predicted FEN can't be parsed at all.
-    """
-    target_squares = _fen_placement_to_squares(target_fen)
-    if target_squares is None:
-        raise ValueError(f"Invalid target FEN: {target_fen}")
-
-    pred_squares = _fen_placement_to_squares(pred_fen)
-    if pred_squares is None:
         return 0.0
 
-    matches = sum(p == t for p, t in zip(pred_squares, target_squares))
-    return matches / len(target_squares)
+    correct_squares = 0
+    total_squares = 64
 
+    for square in chess.SQUARES:
+        pred_piece = pred_board.piece_at(square)
+        gt_piece = gt_board.piece_at(square)
+        if pred_piece == gt_piece:
+            correct_squares += 1
 
-def san_exact_match(pred_san: str, target_san: str) -> bool:
-    """
-    Exact-match on Standard Algebraic Notation, ignoring surrounding
-    whitespace only (SAN is compact enough that any other difference is a
-    real disagreement, e.g. missing a '+'/'#' suffix or a disambiguator).
-    """
-    return pred_san.strip() == target_san.strip()
+    return correct_squares / total_squares
+
+def calculate_san_exact_match(predicted_move: str, ground_truth_move: str) -> int:
+    return 1 if predicted_move.strip() == ground_truth_move.strip() else 0
