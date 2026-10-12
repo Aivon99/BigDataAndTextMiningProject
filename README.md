@@ -2,9 +2,26 @@
 
 Project for the **Big Data Analytics and Text Mining** course at the **University of Bologna**.
 
+- Professor: Gianluca Moro, University of Bologna
+- Tutor: Ing. Giacomo Frisoni
+
 We fine-tune a small vision-language model (Qwen3.5-0.8B) with LoRA to read chessboard images,
 and we study how the order of the image patches changes the results, following the idea of the
 REOrder paper.
+
+## Hugging Face
+
+Datasets, trained models and results are stored in the
+[bdatm-project](https://huggingface.co/bdatm-project) organization on Hugging Face.
+
+| What | Repositories |
+|---|---|
+| Datasets | [dataset_task1](https://huggingface.co/datasets/bdatm-project/dataset_task1), [dataset_task2](https://huggingface.co/datasets/bdatm-project/dataset_task2), [dataset_task3](https://huggingface.co/datasets/bdatm-project/dataset_task3) |
+| LoRA models | `qwen-task{1,2,3}-{strategy}-lora`, for example [qwen-task1-standard-lora](https://huggingface.co/bdatm-project/qwen-task1-standard-lora) |
+| Results | [evaluation-results-task1](https://huggingface.co/datasets/bdatm-project/evaluation-results-task1), [evaluation-results-task2](https://huggingface.co/datasets/bdatm-project/evaluation-results-task2), [evaluation-results-task3](https://huggingface.co/datasets/bdatm-project/evaluation-results-task3) |
+
+The strategy in the model name is `standard`, `zigzag`, `spiral`, `file_wise` or
+`learned-reordering`.
 
 ## Tasks
 
@@ -25,10 +42,8 @@ From each puzzle we take the starting position and the first move.
 - The same puzzles are used for all three tasks. Boards are drawn as 512x512 images without
   coordinates, so every square lines up with the patch grid of the model.
 
-These numbers can be changed in `configs/config.yaml`. The datasets are already on Hugging Face:
-[dataset_task1](https://huggingface.co/datasets/bdatm-project/dataset_task1),
-[dataset_task2](https://huggingface.co/datasets/bdatm-project/dataset_task2),
-[dataset_task3](https://huggingface.co/datasets/bdatm-project/dataset_task3).
+These numbers can be changed in `configs/config.yaml`. The datasets are already on Hugging Face
+(see the links above).
 
 ## Method
 
