@@ -43,7 +43,6 @@ class TokenReorderer:
         self.core.get_rope_index = self._rope_index
         self.core._token_reorderer = self
 
-    # ---------------- order management ----------------
     def set_order(self, square_order: Optional[Sequence[int]]) -> None:
         """Square-level order (length grid_size**2), or None for the model's native raster order."""
         if square_order is None:
@@ -65,10 +64,6 @@ class TokenReorderer:
         finally:
             self._square_order = previous
             self._cache.clear()
-
-    @property
-    def current_order(self) -> Optional[list]:
-        return self._square_order
 
     def token_permutation(self, grid_h: int, grid_w: int, device=None) -> torch.Tensor:
         """
@@ -102,7 +97,6 @@ class TokenReorderer:
             raise ValueError("Token reordering supports still images only (t == 1).")
         return h // self.merge, w // self.merge
 
-    # ---------------- patched methods ----------------
     def _image_features(self, pixel_values, image_grid_thw=None, *args, **kwargs):
         out = self._orig_image_features(pixel_values, image_grid_thw, *args, **kwargs)
         if self._square_order is None:

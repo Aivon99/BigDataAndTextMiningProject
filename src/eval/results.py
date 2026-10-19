@@ -86,7 +86,7 @@ def load_or_init_results_table(task: str, hf_org_prefix: str = "bdatm-project") 
     repo_id = _eval_results_repo_id(task, hf_org_prefix)
     table = load_results_table(repo_id)
     if table is None:
-        print(f"No existing comparison table found for {task} on the Hub (or repo doesn't exist yet) -- starting fresh.")
+        print(f"No existing comparison table found for {task} on the Hub (or the repo doesn't exist yet), starting fresh.")
         return pd.DataFrame()
     print(f"Loaded existing comparison table for {task} from '{repo_id}' ({len(table)} model(s) already evaluated).")
     return table
@@ -162,11 +162,11 @@ def evaluate_with_cache(
                 if not _cached_adapter_matches(cached_sha, adapter_repo_id, adapter_sha):
                     print(
                         f"[{task}] Cached evaluation for '{model_name}' was for different weights than "
-                        f"those now in '{adapter_repo_id}' -- re-evaluating."
+                        f"those now in '{adapter_repo_id}', re-evaluating."
                     )
                     match = match.iloc[0:0]
             if len(match) > 0:
-                print(f"[{task}] Using cached evaluation for '{model_name}' -- skipping inference.")
+                print(f"[{task}] Using cached evaluation for '{model_name}', skipping inference.")
                 summary_df = match.reset_index(drop=True)
                 try:
                     sample_path = hf_hub_download(repo_id, f"per_sample/{slug}.csv", repo_type="dataset")
@@ -194,7 +194,7 @@ def evaluate_with_cache(
     existing = load_results_table(repo_id)
     updated = append_or_replace(existing if existing is not None else pd.DataFrame(), summary_df)
     push_results_table(repo_id, updated, commit_message=f"Cache evaluation for '{model_name}' ({task})")
-    print(f"[{task}] Cached evaluation for '{model_name}' -- pushed to '{repo_id}'.")
+    print(f"[{task}] Cached evaluation for '{model_name}', pushed to '{repo_id}'.")
 
     return results_df, summary_df
 

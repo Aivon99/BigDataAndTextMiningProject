@@ -105,15 +105,6 @@ SAN_DIAGNOSTIC_COLUMNS = [
 ]
 
 
-def summarize_san_diagnostics(analyzed_df: pd.DataFrame, model_name: Optional[str] = None) -> pd.DataFrame:
-    summary = {"model_name": model_name} if model_name else {}
-    if "exact_match" in analyzed_df.columns:
-        summary["exact_match"] = analyzed_df["exact_match"].mean()
-    for col in SAN_DIAGNOSTIC_COLUMNS:
-        summary[col] = analyzed_df[col].mean()
-    return pd.DataFrame([summary])
-
-
 def san_error_breakdown(analyzed_df: pd.DataFrame) -> pd.Series:
     """Counts how many predictions fall into each type of error."""
     def bucket(r):
@@ -180,11 +171,11 @@ def analyze_fen_predictions(results_df: pd.DataFrame) -> pd.DataFrame:
 def fen_error_breakdown(results_df: pd.DataFrame, n_examples: int = 5) -> dict:
     """
     Qualitative error analysis for Task 1 (board field only, what the image shows):
-      wrong_squares_per_board -- how many of the 64 squares are wrong per prediction
-                                 ("unparseable" if the board field isn't valid FEN)
-      confusions              -- (true -> predicted) piece pairs over all wrong squares,
-                                 '.' = empty square, most frequent first
-      examples                -- a few failed predictions with their wrong squares
+      wrong_squares_per_board: how many of the 64 squares are wrong per prediction
+                                ("unparseable" if the board field isn't valid FEN)
+      confusions:              (true -> predicted) piece pairs over all wrong squares,
+                                '.' = empty square, most frequent first
+      examples:                a few failed predictions with their wrong squares
     """
     import chess
 
@@ -221,9 +212,9 @@ def fen_error_breakdown(results_df: pd.DataFrame, n_examples: int = 5) -> dict:
     }
 
 
-# The spec's metrics (section 4) in display order. Task 1: FEN exact match and
-# CER on the board field, the only part of a FEN the image shows. Task 2/3:
-# Exact Match is em_extracted, the move on the answer line.
+# Main metrics in display order. Task 1: FEN exact match and CER on the board
+# field, the only part of a FEN the image shows. Task 2/3: Exact Match is
+# em_extracted, the move on the answer line.
 HEADLINE_COLUMNS = {
     "task1": {
         "board_exact_match": "FEN Exact Match (board)",
@@ -255,7 +246,7 @@ def experiment_setup(model_name: str) -> str:
 
 def headline_table(table: pd.DataFrame, task: str) -> pd.DataFrame:
     """
-    The comparison table with the spec's metrics first (renamed), a `setup`
+    The comparison table with the main metrics first (renamed), a `setup`
     column (token-level runs vs the legacy pixel-tile runs), best first.
     """
     cols = HEADLINE_COLUMNS[task]
@@ -267,47 +258,6 @@ def headline_table(table: pd.DataFrame, task: str) -> pd.DataFrame:
     if sort_by is not None and sort_by.startswith("CER"):
         return out.sort_values(sort_by).reset_index(drop=True)
     return (out.sort_values(sort_by, ascending=False) if sort_by else out).reset_index(drop=True)
-
-
-def rescore_cached_fen_results(hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
-    """Recomputes the FEN columns for every result file cached on the Hub.
-    No GPU needed.
-    """
-    from huggingface_hub import HfApi, hf_hub_download
-
-    repo_id = f"{hf_org_prefix}/evaluation-results-task1"
-    files = [f for f in HfApi().list_repo_files(repo_id, repo_type="dataset")
-             if f.startswith("per_sample/") and f.endswith(".csv")]
-    rows = []
-    for f in files:
-        df = analyze_fen_predictions(pd.read_csv(hf_hub_download(repo_id, f, repo_type="dataset"), keep_default_na=False))
-        summary = {"model_name": f[len("per_sample/"):-4]}
-        for col in ["fen_exact_match", "square_by_square_accuracy", "character_error_rate", *FEN_DIAGNOSTIC_COLUMNS]:
-            if col in df.columns:
-                summary[col] = df[col].mean()
-        rows.append(summary)
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values("board_exact_match", ascending=False).reset_index(drop=True)
-
-
-def rescore_cached_san_results(task: str, fens: Iterable[str], hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
-    """Recomputes the move columns for every result file cached on the Hub.
-    No GPU needed.
-    """
-    from huggingface_hub import HfApi, hf_hub_download
-
-    repo_id = f"{hf_org_prefix}/evaluation-results-{task}"
-    fens = list(fens)
-    files = [f for f in HfApi().list_repo_files(repo_id, repo_type="dataset")
-             if f.startswith("per_sample/") and f.endswith(".csv")]
-    rows = []
-    for f in files:
-        df = pd.read_csv(hf_hub_download(repo_id, f, repo_type="dataset"), keep_default_na=False)
-        rows.append(summarize_san_diagnostics(analyze_san_predictions(df, fens), model_name=f[len("per_sample/"):-4]))
-    if not rows:
-        return pd.DataFrame()
-    return pd.concat(rows, ignore_index=True).sort_values("same_move", ascending=False).reset_index(drop=True)
 
 
 def backfill_cached_metrics(
@@ -424,18 +374,6 @@ def training_health_report(repo_id: str, jump_threshold: float = 0.4, verbose: b
         for p in report["problems"] or ["no problems detected"]:
             print(f"  - {p}")
     return report
-
-
-def supervised_tokens_preview(sample: dict, processor) -> str:
-    """Shows the tokens of one sample that are used in the loss."""
-    from training.preprocessing import preprocess_function
-
-    processed = preprocess_function(sample, processor)
-    labels = processed["labels"]
-    supervised_ids = labels[labels != -100].tolist()
-    text = processor.tokenizer.decode(supervised_ids, skip_special_tokens=False)
-    print(f"{len(supervised_ids)} supervised tokens out of {len(labels)}: {text!r}")
-    return text
 
 
 def _split_frame_patches(pixel_values, image_grid_thw):

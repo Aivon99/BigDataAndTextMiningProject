@@ -187,13 +187,13 @@ def generate_datasets_parallel(
             if skip_existing and stamp_ok and _existing_sample_count(output_dir) == len(split_df):
                 print(
                     f"[{task}/{split_name}] already has {len(split_df)} sample(s) "
-                    f"rendered with '{RENDER_VERSION}' — skipping."
+                    f"rendered with '{RENDER_VERSION}', skipping."
                 )
                 continue
             if skip_existing and _existing_sample_count(output_dir) == len(split_df):
                 print(
                     f"[{task}/{split_name}] has {len(split_df)} sample(s) from an older render "
-                    f"version — re-rendering."
+                    f"version, re-rendering."
                 )
 
             for idx, (_, row) in enumerate(split_df.iterrows()):
@@ -210,7 +210,7 @@ def generate_datasets_parallel(
                 job_dirs.append(output_dir)
 
     if not work_items:
-        print("Nothing to generate — every (task, split) combination is already up to date.")
+        print("Nothing to generate, every (task, split) combination is already up to date.")
         return
 
     num_workers = num_workers or os.cpu_count() or 1

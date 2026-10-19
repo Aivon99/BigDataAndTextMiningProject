@@ -2,8 +2,6 @@
 
 import torch
 
-from training.reordering import reorder_chessboard_image
-
 
 def preprocess_function(sample, processor):
     """Builds the model inputs for one sample. The loss is computed only on the
@@ -138,24 +136,10 @@ class Qwen35VisionDataCollator:
 
 
 class Qwen35OnTheFlyCollator(Qwen35VisionDataCollator):
-    """Preprocesses the raw rows batch by batch, optionally reordering the
-    patches first, so the processed images are never stored on disk.
+    """Preprocesses the raw rows batch by batch, so the processed images are
+    never stored on disk.
     """
 
-    def __init__(self, processor, strategy=None, grid_size=8):
-        super().__init__(processor)
-        self.strategy = strategy
-        self.grid_size = grid_size
-
     def __call__(self, examples):
-        processed = []
-        for ex in examples:
-            ex = dict(ex)
-            if self.strategy is not None:
-                for key in ("image", "image_t1"):
-                    if ex.get(key) is not None:
-                        ex[key] = reorder_chessboard_image(
-                            ex[key], strategy=self.strategy, grid_size=self.grid_size
-                        )
-            processed.append(preprocess_function(ex, self.processor))
+        processed = [preprocess_function(dict(ex), self.processor) for ex in examples]
         return super().__call__(processed)

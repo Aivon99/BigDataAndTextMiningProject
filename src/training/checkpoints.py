@@ -94,7 +94,7 @@ def train_or_load_finished(trainer, repo_id: str, resume_checkpoint: str | None)
     Returns True if training ran.
     """
     if resume_checkpoint and training_is_complete(resume_checkpoint):
-        print(f"Training for '{repo_id}' already finished on the Hub -- skipping training and loading its final adapter.")
+        print(f"Training for '{repo_id}' already finished on the Hub, skipping training and loading its final adapter.")
         set_peft_model_state_dict(trainer.model, load_peft_weights(repo_id))
         return False
     trainer.train(resume_from_checkpoint=resume_checkpoint)

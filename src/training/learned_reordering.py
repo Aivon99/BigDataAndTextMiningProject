@@ -8,8 +8,9 @@ trained together with LoRA by REINFORCE, using REOrder's own policy.
 - Reward = -cross-entropy of the answer. With orders_per_sample=2 two orders
   are scored on the same sample and compared with each other, so the
   difficulty of the puzzle cancels out; with 1, a moving-average baseline.
-- Effective batch 8, gradient clipping, shuffled data every epoch, and the
-  best epoch by validation loss is kept.
+- Effective batch 8, gradient clipping, shuffled data every epoch. Up to 10
+  epochs with early stopping on the validation loss (patience 2), and the best
+  epoch is kept.
 
 Checkpoints are pushed to the Hub during training and resumed automatically.
 """
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, snapshot_download
 from peft import get_peft_model, set_peft_model_state_dict
 from peft.utils import load_peft_weights
 from transformers import get_linear_schedule_with_warmup
@@ -46,7 +47,7 @@ def make_policy(grid_size: int = 8):
 
 
 def greedy_order(policy) -> list:
-    """The policy's single best ordering (argsort of its logits, no noise) -- used at evaluation."""
+    """The policy's single best ordering (argsort of its logits, no noise), used at evaluation."""
     return torch.argsort(policy.logits.detach(), descending=True).tolist()
 
 
@@ -122,7 +123,8 @@ def train_with_learned_reordering(
     hf_org_prefix: str = "bdatm-project",
     tag: Optional[str] = None,
     grid_size: int = 8,
-    num_train_epochs: int = 4,
+    num_train_epochs: int = 10,
+    early_stopping_patience: int = 2,
     policy_start_after_epochs: int = 1,
     gumbel_temp_start: float = 0.2,
     gumbel_temp_end: float = 0.0,
@@ -186,6 +188,9 @@ def train_with_learned_reordering(
         _upload(out / _CHECKPOINT_SUBDIR, repo_id, _CHECKPOINT_SUBDIR, message)
 
     for epoch in range(state["epoch"], num_train_epochs):
+        if state["best_epoch"] is not None and epoch - state["best_epoch"] > early_stopping_patience:
+            print(f"[{task}] Early stopping: no improvement since epoch {state['best_epoch']}.")
+            break
         policy_active = epoch >= policy_start_after_epochs
         rows = train_split.shuffle(seed=seed + epoch)
         n_rows = len(rows)
@@ -280,12 +285,6 @@ def train_with_learned_reordering(
         HfApi().upload_file(path_or_fileobj=str(final / name), path_in_repo=name, repo_id=repo_id,
                             repo_type="model", commit_message=f"Learned order + policy ({task})")
     return lora_model, policy, repo_id, order
-
-
-def load_learned_order(repo_id: str) -> Optional[list]:
-    """The order a finished learned-reordering run selected (None = raster), from the Hub."""
-    path = hf_hub_download(repo_id, _ORDER_FILE, repo_type="model")
-    return json.loads(Path(path).read_text())["order"]
 
 
 def describe_order(order: Optional[list], grid_size: int = 8) -> str:

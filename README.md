@@ -50,8 +50,12 @@ From each puzzle we take the starting position and the first move.
 - Boards are drawn with python-chess and cairosvg as 512x512 images without coordinates, so the
   8x8 squares fill the whole image. Task 2 uses python-chess's last-move highlight.
 
-These numbers can be changed in `configs/config.yaml`. The datasets are already on Hugging Face
-(see the links above).
+These numbers can be changed in `configs/config.yaml`.
+
+Lichess publishes only the latest version of the puzzle database and replaces it regularly, without
+keeping the older versions, so running `Datasets_creator.ipynb` today downloads a newer file and
+gives a different sample. The exact datasets we used are on Hugging Face (see the links above), so
+all the experiments can be reproduced from them.
 
 ## Method
 
@@ -139,16 +143,17 @@ Main findings:
   accuracy is above 97.9% for every order.
 - The order matters at test time: a model trained in raster order collapses when it reads the
   tokens in any other order (0% on Task 1).
-- When a model is trained with an order, no fixed order wins on every task, and the differences are
-  close to the sampling noise of 400 samples (about ±1.7 points on Task 1).
+- When a model is trained with an order, no fixed order wins on every task (spiral_center_out on
+  Task 1, raster on Task 2, file_wise on Task 3).
 - The learned order stays close to raster and does not beat it.
 - 512px is better than the 1:1 grid, especially on Task 3: more tokens per square help more than
   the exact alignment.
 - On Task 2, most errors of the raster model are notation only. In 119 of its 121 "same move,
   different notation" errors, the only difference is `x`, `+` or `#`. A single image taken after
   the move cannot show whether a piece was captured, and 147 of the 400 test moves are captures.
-- On Task 3, swapping or duplicating the two frames raises the answer loss about 9-13 times, so
-  the model really compares the two images.
+- On Task 3 (raster model, 100 test samples), swapping the two frames or giving the same frame
+  twice raises the answer loss from 0.16 to 1.4-2.2 (about 9-13 times), and the correct order has
+  the lowest loss on 94% of the samples. So the model really compares the two images.
 
 The full tables (with all metrics) are on Hugging Face:
 [Task 1](https://huggingface.co/datasets/bdatm-project/evaluation-results-task1),
@@ -187,13 +192,11 @@ src/
     checkpoints.py         saves and resumes training runs on Hugging Face
     preprocessing.py       turns dataset rows into model inputs
     resolution.py          sets the image resolution of the processor (256px = 1 token per square)
-    reordering.py          the scan orders (and the legacy pixel-tile reordering)
+    reordering.py          the scan orders
     token_reordering.py    applies a scan order to the visual tokens inside the model
     reorder_lib.py         downloads and loads the REOrder code
     finetune.py            LoRA fine-tuning for one task and one scan order
     learned_reordering.py  learned reordering with REOrder's Plackett-Luce policy
-presentation/
-  build_deck.py            builds the presentation slides
 requirements.txt
 ```
 
@@ -214,13 +217,17 @@ On Colab each notebook clones this repository by itself, from the branch set in
 the packages with `pip install -r requirements.txt`. The task notebooks also install
 `flash-linear-attention`.
 
-The last cell of each task notebook saves the notebook to GitHub and closes the Colab runtime. It
-only works on Colab and needs a GitHub token saved as a Colab secret called `GITHUB_TOKEN_BIG`;
-skip it otherwise.
+The last cell of `Task_1.ipynb` saves the notebook to GitHub and closes the Colab runtime. It only
+runs on Colab (`CONFIG["colab"] = True`) and needs a GitHub token saved as a Colab secret called
+`GITHUB_TOKEN_BIG`.
 
 Trained models and results are saved on Hugging Face as the notebooks run. If a notebook is
 stopped, running it again picks up training from the last checkpoint and skips the evaluations
 that are already done, so nothing is computed twice.
+
+All the repositories are under the `bdatm-project` organization, set by `hf_org_prefix` in the
+notebooks. To retrain the models from scratch, change `hf_org_prefix` to your own Hugging Face
+namespace.
 
 ## Authors
 
