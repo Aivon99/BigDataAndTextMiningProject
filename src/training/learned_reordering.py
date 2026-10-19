@@ -296,3 +296,95 @@ def describe_order(order: Optional[list], grid_size: int = 8) -> str:
              for r in range(grid_size)]
     lines.append("   " + "  ".join("abcdefgh"[:grid_size]))
     return "\n".join(lines)
+
+
+def load_learned_policy(repo_id: str, grid_size: int = 8):
+    """The policy of a finished learned-reordering run (policy.pt on the Hub), frozen."""
+    from huggingface_hub import hf_hub_download
+
+    policy = make_policy(grid_size)
+    policy.load_state_dict(torch.load(hf_hub_download(repo_id, "policy.pt"), map_location="cpu"))
+    policy.requires_grad_(False)
+    return policy.eval()
+
+
+def finetune_with_frozen_policy(
+    dataset,
+    processor,
+    model,
+    task: str,
+    hf_org_prefix: str = "bdatm-project",
+    tag: Optional[str] = None,
+    policy=None,
+    grid_size: int = 8,
+    num_train_epochs: int = 10,
+    early_stopping_patience: int = 2,
+):
+    """REOrder's last phase: once the policy has been learned it is frozen, and
+    the same model keeps training with the policy's deterministic order
+    (argsort of its logits), used for validation too.
+
+    Starts from the LoRA adapter of the learned-reordering run and its policy
+    (fetched from the Hub unless `policy` is given), trains with the Trainer
+    recipe of the fixed orders and pushes to the "learned-frozen" repo.
+    Returns (model, order, repo_id).
+    """
+    from peft import PeftModel
+    from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+
+    from training.checkpoints import HubBestAdapterCallback, find_resumable_checkpoint, train_or_load_finished
+    from training.preprocessing import Qwen35OnTheFlyCollator
+    from training.reordering import resolve_square_order
+
+    learned_repo = experiment_repo_id(task, "learned", tag, hf_org_prefix)
+    repo_id = experiment_repo_id(task, "learned-frozen", tag, hf_org_prefix)
+    if policy is None:
+        policy = load_learned_policy(learned_repo, grid_size)
+    order = greedy_order(policy)
+    print(f"[{task}] Frozen policy from {learned_repo} -> {repo_id}")
+
+    install_token_reordering(model, grid_size=grid_size).set_order(resolve_square_order(order))
+    lora_model = PeftModel.from_pretrained(model, learned_repo, is_trainable=True)
+    resume_checkpoint = find_resumable_checkpoint(repo_id)
+
+    args = TrainingArguments(
+        output_dir=f"./temp_{task}_learned-frozen_{tag or 'base'}_output",
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        gradient_accumulation_steps=1,
+        learning_rate=2e-4,
+        logging_steps=10,
+        num_train_epochs=num_train_epochs,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        save_total_limit=2,
+        push_to_hub=True,
+        hub_model_id=repo_id,
+        hub_strategy="checkpoint",
+        bf16=True,
+        dataloader_num_workers=4,
+        remove_unused_columns=False,
+        report_to="none",
+    )
+    trainer = Trainer(
+        model=lora_model,
+        args=args,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"],
+        data_collator=Qwen35OnTheFlyCollator(processor=processor),
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=early_stopping_patience), HubBestAdapterCallback(repo_id)],
+    )
+
+    print(("Resuming from " + resume_checkpoint) if resume_checkpoint else "Training from the learned adapter...")
+    if train_or_load_finished(trainer, repo_id, resume_checkpoint):
+        trainer.model.push_to_hub(repo_id, commit_message=f"Learned reordering, frozen policy ({task})")
+        processor.push_to_hub(repo_id)
+        HfApi().upload_file(
+            path_or_fileobj=json.dumps({"order": order, "policy_repo": learned_repo}).encode("utf-8"),
+            path_in_repo=_ORDER_FILE, repo_id=repo_id, repo_type="model",
+            commit_message=f"Frozen policy order ({task})",
+        )
+    return trainer.model, order, repo_id
