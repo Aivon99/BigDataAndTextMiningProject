@@ -11,7 +11,7 @@ _FEN_RE = re.compile(
 )
 
 
-def extract_fen(text: str) -> str:
+def extract_fen(text):
     """Returns the first FEN found in the model output, or the whole output if
     there is none.
     """
@@ -19,11 +19,11 @@ def extract_fen(text: str) -> str:
     return match.group(0).strip() if match else text.strip()
 
 
-def calculate_fen_exact_match(predicted_fen: str, ground_truth_fen: str) -> float:
+def calculate_fen_exact_match(predicted_fen, ground_truth_fen):
     return 1.0 if predicted_fen.strip() == ground_truth_fen.strip() else 0.0
 
 
-def calculate_levenshtein_metrics(predicted_fen: str, ground_truth_fen: str) -> dict:
+def calculate_levenshtein_metrics(predicted_fen, ground_truth_fen):
     pred = predicted_fen.strip()
     gt = ground_truth_fen.strip()
 
@@ -36,7 +36,7 @@ def calculate_levenshtein_metrics(predicted_fen: str, ground_truth_fen: str) -> 
     }
 
 
-def calculate_square_by_square_accuracy(predicted_fen: str, ground_truth_fen: str) -> float:
+def calculate_square_by_square_accuracy(predicted_fen, ground_truth_fen):
     """Share of the 64 squares that match. Returns 0 if the predicted FEN
     can't be parsed.
     """
@@ -57,5 +57,5 @@ def calculate_square_by_square_accuracy(predicted_fen: str, ground_truth_fen: st
 
     return correct_squares / total_squares
 
-def calculate_san_exact_match(predicted_move: str, ground_truth_move: str) -> int:
+def calculate_san_exact_match(predicted_move, ground_truth_move):
     return 1 if predicted_move.strip() == ground_truth_move.strip() else 0

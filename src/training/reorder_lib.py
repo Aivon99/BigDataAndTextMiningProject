@@ -18,7 +18,7 @@ REORDER_COMMIT = "ddb290409c8bfbe49f7a5b1bcc19e2da0a94ded6"
 REORDER_DIR = Path(__file__).resolve().parents[2] / "external" / "REOrder"
 
 
-def ensure_reorder_checkout(reorder_dir: Path = REORDER_DIR) -> Path:
+def ensure_reorder_checkout(reorder_dir=REORDER_DIR):
     marker = reorder_dir / "src" / "models" / "layers" / "plackett_luce.py"
     if marker.exists():
         return reorder_dir
@@ -65,7 +65,7 @@ def load_reorder() -> types.SimpleNamespace:
     )
 
 
-def reorder_scan_order(name: str, grid_size: int = 8) -> list:
+def reorder_scan_order(name, grid_size=8):
     """
     A REOrder scan order over a grid_size x grid_size grid, as a list of
     raster indices in visiting order (same convention as

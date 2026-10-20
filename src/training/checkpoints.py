@@ -16,7 +16,7 @@ TRAINING_RECIPE = "answer-only-loss-v1"
 _RECIPE_FILE = "training_recipe.json"
 
 
-def read_training_recipe(repo_id: str) -> str | None:
+def read_training_recipe(repo_id):
     """Returns the training recipe saved in a Hub repo, or None if there is none."""
     try:
         path = hf_hub_download(repo_id, _RECIPE_FILE, repo_type="model")
@@ -25,7 +25,7 @@ def read_training_recipe(repo_id: str) -> str | None:
     return json.loads(Path(path).read_text()).get("recipe")
 
 
-def stamp_training_recipe(repo_id: str, recipe: str = TRAINING_RECIPE) -> None:
+def stamp_training_recipe(repo_id, recipe=TRAINING_RECIPE):
     """Saves the training recipe in the Hub repo."""
     api = HfApi()
     api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
@@ -41,7 +41,7 @@ def stamp_training_recipe(repo_id: str, recipe: str = TRAINING_RECIPE) -> None:
 _RUN_STATE_FOLDERS = ("last-checkpoint", "best-checkpoint")
 
 
-def find_resumable_checkpoint(repo_id: str) -> str | None:
+def find_resumable_checkpoint(repo_id):
     """Downloads the last checkpoint of a run from the Hub, if there is one, so
     training can resume.
 
@@ -82,14 +82,14 @@ def find_resumable_checkpoint(repo_id: str) -> str | None:
     return None
 
 
-def training_is_complete(checkpoint_dir: str) -> bool:
+def training_is_complete(checkpoint_dir):
     """True if the run in the checkpoint already finished."""
     state = json.loads((Path(checkpoint_dir) / "trainer_state.json").read_text())
     control = state.get("stateful_callbacks", {}).get("TrainerControl", {}).get("args", {})
     return bool(control.get("should_training_stop")) or state["global_step"] >= state["max_steps"]
 
 
-def train_or_load_finished(trainer, repo_id: str, resume_checkpoint: str | None) -> bool:
+def train_or_load_finished(trainer, repo_id, resume_checkpoint):
     """Trains the model, or loads the final adapter if the run already finished.
     Returns True if training ran.
     """
@@ -108,7 +108,7 @@ class HubBestAdapterCallback(TrainerCallback):
 
     _FOLDER = "best-checkpoint"
 
-    def __init__(self, repo_id: str):
+    def __init__(self, repo_id):
         self.repo_id = repo_id
 
     def on_save(self, args, state, control, **kwargs):

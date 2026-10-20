@@ -2,12 +2,9 @@
 
 torch
 torchvision
-torchaudio
 transformers>=4.45.0
 accelerate
-torchao
 peft
-qwen-vl-utils
 
 datasets
 huggingface_hub
@@ -25,4 +22,3 @@ python-Levenshtein
 zstandard
 
 tqdm
-matplotlib

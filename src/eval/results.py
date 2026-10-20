@@ -23,7 +23,7 @@ _EVAL_FUNCS = {
 }
 
 
-def _eval_results_repo_id(task: str, hf_org_prefix: str) -> str:
+def _eval_results_repo_id(task, hf_org_prefix):
     return f"{hf_org_prefix}/evaluation-results-{task}"
 
 
@@ -42,7 +42,7 @@ Model-comparison table for this task: one row per evaluated model, written by
 """
 
 
-def load_results_table(repo_id: str) -> pd.DataFrame | None:
+def load_results_table(repo_id):
     """Reads the results table from the Hub. Returns None if it doesn't exist yet."""
     api = HfApi()
     if not api.repo_exists(repo_id=repo_id, repo_type="dataset"):
@@ -59,7 +59,7 @@ def load_results_table(repo_id: str) -> pd.DataFrame | None:
     )
 
 
-def push_results_table(repo_id: str, table: pd.DataFrame, commit_message: str = "Update results table") -> None:
+def push_results_table(repo_id, table, commit_message="Update results table"):
     """Replaces the results table on the Hub with the given one."""
     from huggingface_hub import CommitOperationAdd, CommitOperationDelete
 
@@ -81,7 +81,7 @@ def push_results_table(repo_id: str, table: pd.DataFrame, commit_message: str = 
     )
 
 
-def load_or_init_results_table(task: str, hf_org_prefix: str = "bdatm-project") -> pd.DataFrame:
+def load_or_init_results_table(task, hf_org_prefix="bdatm-project"):
     """Loads the results table of a task, or returns an empty one."""
     repo_id = _eval_results_repo_id(task, hf_org_prefix)
     table = load_results_table(repo_id)
@@ -92,7 +92,7 @@ def load_or_init_results_table(task: str, hf_org_prefix: str = "bdatm-project") 
     return table
 
 
-def append_or_replace(all_results: pd.DataFrame, summary_df: pd.DataFrame) -> pd.DataFrame:
+def append_or_replace(all_results, summary_df):
     """Adds the summary row of a model, replacing the old row with the same
     model_name.
     """
@@ -105,7 +105,7 @@ def append_or_replace(all_results: pd.DataFrame, summary_df: pd.DataFrame) -> pd
 _ADAPTER_WEIGHTS = "adapter_model.safetensors"
 
 
-def adapter_fingerprint(repo_id: str, revision: str | None = None) -> str:
+def adapter_fingerprint(repo_id, revision=None):
     """Returns the sha256 of the LoRA weights file on the Hub, without
     downloading it.
     """
@@ -117,7 +117,7 @@ def adapter_fingerprint(repo_id: str, revision: str | None = None) -> str:
     raise FileNotFoundError(f"No {_ADAPTER_WEIGHTS} in '{repo_id}' at revision {revision or 'main'}")
 
 
-def _cached_adapter_matches(cached, adapter_repo_id: str, current_fingerprint: str) -> bool:
+def _cached_adapter_matches(cached, adapter_repo_id, current_fingerprint):
     if not isinstance(cached, str) or not cached:
         return False
     if cached == current_fingerprint:
@@ -129,14 +129,14 @@ def _cached_adapter_matches(cached, adapter_repo_id: str, current_fingerprint: s
 
 
 def evaluate_with_cache(
-    task: str,
+    task,
     model,
     processor,
     dataset_split,
-    model_name: str,
-    hf_org_prefix: str = "bdatm-project",
-    force: bool = False,
-    adapter_repo_id: str | None = None,
+    model_name,
+    hf_org_prefix="bdatm-project",
+    force=False,
+    adapter_repo_id=None,
     **eval_kwargs,
 ):
     """Same as evaluate_chessboard_model_task_N, but first looks for a cached
@@ -200,15 +200,15 @@ def evaluate_with_cache(
 
 
 def evaluate_with_order(
-    task: str,
+    task,
     model,
     processor,
     dataset_split,
-    model_name: str,
+    model_name,
     order=None,
-    hf_org_prefix: str = "bdatm-project",
-    adapter_repo_id: str | None = None,
-    force: bool = False,
+    hf_org_prefix="bdatm-project",
+    adapter_repo_id=None,
+    force=False,
     **eval_kwargs,
 ):
     """evaluate_with_cache with the visual tokens read in the given order

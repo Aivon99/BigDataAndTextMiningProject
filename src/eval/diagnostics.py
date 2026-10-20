@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 import chess
 import pandas as pd
@@ -16,7 +16,7 @@ _SAN_RE = re.compile(
 )
 
 
-def extract_san(text: str) -> str:
+def extract_san(text):
     """Takes the SAN move from the first line of the model output."""
     if not isinstance(text, str):
         return ""
@@ -27,7 +27,7 @@ def extract_san(text: str) -> str:
     return match.group(0).replace("0-0-0", "O-O-O").replace("0-0", "O-O")
 
 
-def _parse(board: chess.Board, san: str) -> Optional[chess.Move]:
+def _parse(board: chess.Board, san) -> Optional[chess.Move]:
     try:
         return board.parse_san(san)
     except Exception:
@@ -38,7 +38,7 @@ _SAN_PARTS_RE = re.compile(r"^([KQRBN])?([a-h])?([1-8])?x?([a-h][1-8])(?:=?([QRB
 _PIECES = {"K": chess.KING, "Q": chess.QUEEN, "R": chess.ROOK, "B": chess.BISHOP, "N": chess.KNIGHT}
 
 
-def _ambiguous_candidates(board: chess.Board, san: str) -> list:
+def _ambiguous_candidates(board: chess.Board, san):
     m = _SAN_PARTS_RE.match(san)
     if not m:
         return []
@@ -56,7 +56,7 @@ def _ambiguous_candidates(board: chess.Board, san: str) -> list:
     ]
 
 
-def analyze_san_predictions(results_df: pd.DataFrame, fens: Iterable[str]) -> pd.DataFrame:
+def analyze_san_predictions(results_df, fens):
     """Adds move level columns (legal move, same move, right squares, right
     piece) to the Task 2/3 results.
 
@@ -105,7 +105,7 @@ SAN_DIAGNOSTIC_COLUMNS = [
 ]
 
 
-def san_error_breakdown(analyzed_df: pd.DataFrame) -> pd.Series:
+def san_error_breakdown(analyzed_df):
     """Counts how many predictions fall into each type of error."""
     def bucket(r):
         if r["em_extracted"]:
@@ -132,7 +132,7 @@ FEN_DIAGNOSTIC_COLUMNS = [
 ]
 
 
-def _levenshtein(a: str, b: str) -> int:
+def _levenshtein(a, b):
     try:
         import Levenshtein
         return Levenshtein.distance(a, b)
@@ -146,7 +146,7 @@ def _levenshtein(a: str, b: str) -> int:
         return prev[-1]
 
 
-def analyze_fen_predictions(results_df: pd.DataFrame) -> pd.DataFrame:
+def analyze_fen_predictions(results_df):
     """Adds one column per FEN field to the Task 1 results. Only the board part
     can really be seen in the image.
     """
@@ -168,7 +168,7 @@ def analyze_fen_predictions(results_df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df, pd.DataFrame(rows)], axis=1)
 
 
-def fen_error_breakdown(results_df: pd.DataFrame, n_examples: int = 5) -> dict:
+def fen_error_breakdown(results_df, n_examples=5):
     """
     Qualitative error analysis for Task 1 (board field only, what the image shows):
       wrong_squares_per_board: how many of the 64 squares are wrong per prediction
@@ -234,7 +234,7 @@ HEADLINE_COLUMNS = {
 HEADLINE_COLUMNS["task3"] = HEADLINE_COLUMNS["task2"]
 
 
-def experiment_setup(model_name: str) -> str:
+def experiment_setup(model_name):
     """Which experimental setup a results row belongs to, from its name tag."""
     m = re.search(r"\[([^\]]+)\]\s*$", str(model_name))
     if not m:
@@ -244,7 +244,7 @@ def experiment_setup(model_name: str) -> str:
     return f"token reordering, {t.group(1)}px" if t else tag
 
 
-def headline_table(table: pd.DataFrame, task: str) -> pd.DataFrame:
+def headline_table(table, task):
     """
     The comparison table with the main metrics first (renamed), a `setup`
     column (token-level runs vs the legacy pixel-tile runs), best first.
@@ -261,12 +261,12 @@ def headline_table(table: pd.DataFrame, task: str) -> pd.DataFrame:
 
 
 def backfill_cached_metrics(
-    table: pd.DataFrame,
-    task: str,
-    fens: Optional[Iterable[str]] = None,
-    hf_org_prefix: str = "bdatm-project",
-    drop_models: Iterable[str] = (),
-) -> pd.DataFrame:
+    table,
+    task,
+    fens=None,
+    hf_org_prefix="bdatm-project",
+    drop_models=(),
+):
     """Recomputes the diagnostic columns of the results table from the
     per-sample files on the Hub. Models in drop_models are removed.
     """
@@ -304,7 +304,7 @@ def backfill_cached_metrics(
     return out
 
 
-def training_health_report(repo_id: str, jump_threshold: float = 0.4, verbose: bool = True) -> dict:
+def training_health_report(repo_id, jump_threshold=0.4, verbose=True):
     """Reads the training logs of a run from the Hub and flags sudden jumps in
     the eval loss.
     """
@@ -383,7 +383,7 @@ def _split_frame_patches(pixel_values, image_grid_thw):
     return pixel_values[: sizes[0]], pixel_values[sizes[0]:]
 
 
-def frame_ablation_losses(model, processor, dataset_split, n_samples: int = 50) -> pd.DataFrame:
+def frame_ablation_losses(model, processor, dataset_split, n_samples=50):
     """Task 3 check: compares the loss with the two frames in the right order,
     swapped or repeated. If the model really uses both frames, the right
     order should have the lowest loss.
@@ -432,7 +432,7 @@ def frame_ablation_losses(model, processor, dataset_split, n_samples: int = 50) 
 DRIVE_ROOT = "/content/drive/MyDrive/bdatm_diagnostics"
 
 
-def save_diagnostics(df: pd.DataFrame, name: str, task: str, local_root: str = "./diagnostics") -> Path:
+def save_diagnostics(df, name, task, local_root="./diagnostics"):
     """Saves a DataFrame as CSV, on Google Drive if it is mounted, otherwise in
     a local folder.
     """

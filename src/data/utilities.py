@@ -1,20 +1,18 @@
 """Helpers to load the config file and the Lichess puzzle CSV."""
 
-from pathlib import Path
-
 import yaml
 import pandas as pd
 
 
-def load_config(config_path: str | Path = "configs/config.yaml") -> dict:
+def load_config(config_path="configs/config.yaml"):
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def load_lichess_csv(
-    csv_path: str,
-    max_samples: int = None,
-    seed: int = 42
+    csv_path,
+    max_samples=None,
+    seed=42
 ):
     """Loads the Lichess CSV and takes a random sample of max_samples rows."""
 
@@ -37,10 +35,10 @@ def load_lichess_csv(
 
 
 def clamp_balanced_turn_counts(
-    df: pd.DataFrame,
-    n_per_turn: int,
-    turn_col: str = "turn",
-) -> int:
+    df,
+    n_per_turn,
+    turn_col="turn",
+):
     """Lowers n_per_turn if there are not enough white or black puzzles."""
     available_white = int((df[turn_col] == "w").sum())
     available_black = int((df[turn_col] == "b").sum())

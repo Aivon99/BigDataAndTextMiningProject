@@ -18,7 +18,6 @@ Checkpoints are pushed to the Hub during training and resumed automatically.
 import json
 import math
 from pathlib import Path
-from typing import Optional
 
 import torch
 from huggingface_hub import HfApi, snapshot_download
@@ -39,19 +38,19 @@ _ORDER_FILE = "learned_order.json"
 _NO_UNSQUEEZE = {"pixel_values", "image_grid_thw"}
 
 
-def make_policy(grid_size: int = 8):
+def make_policy(grid_size=8):
     """REOrder's Plackett-Luce policy, one independent order per sample."""
     return load_reorder().PlackettLucePolicy(
         num_patches=grid_size * grid_size, method="gumbel", granularity="image", logit_init="row-major"
     )
 
 
-def greedy_order(policy) -> list:
+def greedy_order(policy):
     """The policy's single best ordering (argsort of its logits, no noise), used at evaluation."""
     return torch.argsort(policy.logits.detach(), descending=True).tolist()
 
 
-def _to_model_inputs(sample: dict, device) -> tuple:
+def _to_model_inputs(sample, device):
     inputs = {}
     for k, v in sample.items():
         if k == "labels":
@@ -63,21 +62,21 @@ def _to_model_inputs(sample: dict, device) -> tuple:
     return inputs, labels
 
 
-def _raw_sample(row: dict, task: str) -> dict:
+def _raw_sample(row, task):
     sample = {"task": task, "image": row["image"], "prompt": row["prompt"], "target": row["target"]}
     if task == "task3":
         sample["image_t1"] = row["image_t1"]
     return sample
 
 
-def _upload(local_dir: Path, repo_id: str, path_in_repo: str, message: str) -> None:
+def _upload(local_dir, repo_id, path_in_repo, message):
     api = HfApi()
     api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
     api.upload_folder(repo_id=repo_id, repo_type="model", folder_path=str(local_dir),
                       path_in_repo=path_in_repo, commit_message=message)
 
 
-def _save_state(local_dir: Path, lora_model, policy, extra: Optional[dict] = None, optimizers=None) -> None:
+def _save_state(local_dir, lora_model, policy, extra=None, optimizers=None):
     local_dir.mkdir(parents=True, exist_ok=True)
     lora_model.save_pretrained(str(local_dir))
     torch.save(policy.state_dict(), local_dir / "policy.pt")
@@ -87,7 +86,7 @@ def _save_state(local_dir: Path, lora_model, policy, extra: Optional[dict] = Non
     (local_dir / "metadata.json").write_text(json.dumps({"recipe": LEARNED_RECIPE, **(extra or {})}))
 
 
-def _find_state(repo_id: str, subdir: str) -> Optional[tuple]:
+def _find_state(repo_id, subdir):
     """(local_dir, metadata) of a learned-reordering state on the Hub, if its recipe matches."""
     api = HfApi()
     if not api.repo_exists(repo_id=repo_id, repo_type="model"):
@@ -103,7 +102,7 @@ def _find_state(repo_id: str, subdir: str) -> Optional[tuple]:
 
 
 @torch.no_grad()
-def _validation_loss(lora_model, reorderer, processor, rows, task, order, device) -> float:
+def _validation_loss(lora_model, reorderer, processor, rows, task, order, device):
     lora_model.eval()
     losses = []
     with reorderer.order(order):
@@ -119,26 +118,26 @@ def train_with_learned_reordering(
     processor,
     model,
     peft_config,
-    task: str,
-    hf_org_prefix: str = "bdatm-project",
-    tag: Optional[str] = None,
-    grid_size: int = 8,
-    num_train_epochs: int = 10,
-    early_stopping_patience: int = 2,
-    policy_start_after_epochs: int = 1,
-    gumbel_temp_start: float = 0.2,
-    gumbel_temp_end: float = 0.0,
-    orders_per_sample: int = 2,
-    baseline_momentum: float = 0.99,
-    learning_rate: float = 2e-4,
-    policy_learning_rate: float = 1e-3,
-    grad_accum_steps: int = 8,
-    max_grad_norm: float = 1.0,
-    val_samples: int = 200,
-    checkpoint_every_steps: int = 100,
-    log_every: int = 50,
-    output_dir: str = "./learned_reordering_output",
-    seed: int = 42,
+    task,
+    hf_org_prefix="bdatm-project",
+    tag=None,
+    grid_size=8,
+    num_train_epochs=10,
+    early_stopping_patience=2,
+    policy_start_after_epochs=1,
+    gumbel_temp_start=0.2,
+    gumbel_temp_end=0.0,
+    orders_per_sample=2,
+    baseline_momentum=0.99,
+    learning_rate=2e-4,
+    policy_learning_rate=1e-3,
+    grad_accum_steps=8,
+    max_grad_norm=1.0,
+    val_samples=200,
+    checkpoint_every_steps=100,
+    log_every=50,
+    output_dir="./learned_reordering_output",
+    seed=42,
 ):
     """
     Jointly trains LoRA and a REOrder Plackett-Luce policy over square
@@ -182,7 +181,7 @@ def train_with_learned_reordering(
     else:
         print(f"[{task}] Learned reordering: starting fresh -> {repo_id}")
 
-    def checkpoint(message: str) -> None:
+    def checkpoint(message):
         _save_state(out / _CHECKPOINT_SUBDIR, lora_model, policy, extra=state, optimizers={
             "model_optimizer": model_optimizer, "policy_optimizer": policy_optimizer, "scheduler": scheduler})
         _upload(out / _CHECKPOINT_SUBDIR, repo_id, _CHECKPOINT_SUBDIR, message)
@@ -287,7 +286,7 @@ def train_with_learned_reordering(
     return lora_model, policy, repo_id, order
 
 
-def describe_order(order: Optional[list], grid_size: int = 8) -> str:
+def describe_order(order, grid_size=8):
     """The order as a board diagram: each square shows its reading step (0 = read first)."""
     if order is None:
         order = list(range(grid_size * grid_size))
@@ -298,7 +297,7 @@ def describe_order(order: Optional[list], grid_size: int = 8) -> str:
     return "\n".join(lines)
 
 
-def load_learned_policy(repo_id: str, grid_size: int = 8):
+def load_learned_policy(repo_id, grid_size=8):
     """The policy of a finished learned-reordering run (policy.pt on the Hub), frozen."""
     from huggingface_hub import hf_hub_download
 
@@ -312,13 +311,13 @@ def finetune_with_frozen_policy(
     dataset,
     processor,
     model,
-    task: str,
-    hf_org_prefix: str = "bdatm-project",
-    tag: Optional[str] = None,
+    task,
+    hf_org_prefix="bdatm-project",
+    tag=None,
     policy=None,
-    grid_size: int = 8,
-    num_train_epochs: int = 10,
-    early_stopping_patience: int = 2,
+    grid_size=8,
+    num_train_epochs=10,
+    early_stopping_patience=2,
 ):
     """REOrder's last phase: once the policy has been learned it is frozen, and
     the same model keeps training with the policy's deterministic order

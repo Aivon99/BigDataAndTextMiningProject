@@ -19,7 +19,7 @@ from eval.metrics import (
 )
 
 
-def stop_token_kwargs(processor) -> dict:
+def stop_token_kwargs(processor):
     """generate() arguments that stop at the end of the answer.
 
     The checkpoint has no generation_config.json, so generate() would only stop
@@ -30,13 +30,13 @@ def stop_token_kwargs(processor) -> dict:
     return {"eos_token_id": stop_ids, "pad_token_id": tok.pad_token_id}
 
 
-def _sample_images(sample, task: str) -> list:
+def _sample_images(sample, task):
     if task == "task3":
         return [sample["image"], sample["image_t1"]]
     return [sample["image"]]
 
 
-def build_chat(sample, task: str, few_shot_examples=None):
+def build_chat(sample, task, few_shot_examples=None):
     """Chat messages and their images for one sample. Each few-shot example is
     added before it as a solved question/answer pair.
     """
@@ -54,7 +54,7 @@ def build_chat(sample, task: str, few_shot_examples=None):
     return messages, images
 
 
-def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name: str, few_shot_examples=None) -> pd.DataFrame:
+def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name, few_shot_examples=None):
     """Evaluates a model on Task 1 (image to FEN). Returns the per-sample
     results and a one-row summary.
     """
@@ -126,7 +126,7 @@ def evaluate_chessboard_model_task_1(model, processor, dataset_split, model_name
 
     return results_df, model_summary_df
 
-def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name: str, few_shot_examples=None) -> pd.DataFrame:
+def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name, few_shot_examples=None):
     """Evaluates a model on Task 2 (last move from one image). Returns the
     per-sample results and a one-row summary.
     """
@@ -188,7 +188,7 @@ def evaluate_chessboard_model_task_2(model, processor, dataset_split, model_name
     return results_df, model_summary_df
 
 
-def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name: str, few_shot_examples=None) -> pd.DataFrame:
+def evaluate_chessboard_model_task_3(model, processor, dataset_split, model_name, few_shot_examples=None):
     """Evaluates a model on Task 3 (move between two images). Returns the
     per-sample results and a one-row summary.
     """

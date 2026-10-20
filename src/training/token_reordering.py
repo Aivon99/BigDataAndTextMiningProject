@@ -16,7 +16,7 @@ is one LLM token; at 512px it is a 2x2 block of tokens, moved as a unit.
 """
 
 from contextlib import contextmanager
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 
@@ -31,7 +31,7 @@ def _find_core_model(model):
 
 
 class TokenReorderer:
-    def __init__(self, model, grid_size: int = 8):
+    def __init__(self, model, grid_size=8):
         self.core = _find_core_model(model)
         self.grid_size = grid_size
         self.merge = int(self.core.config.vision_config.spatial_merge_size)
@@ -43,7 +43,7 @@ class TokenReorderer:
         self.core.get_rope_index = self._rope_index
         self.core._token_reorderer = self
 
-    def set_order(self, square_order: Optional[Sequence[int]]) -> None:
+    def set_order(self, square_order):
         """Square-level order (length grid_size**2), or None for the model's native raster order."""
         if square_order is None:
             self._square_order = None
@@ -56,7 +56,7 @@ class TokenReorderer:
         self._cache.clear()
 
     @contextmanager
-    def order(self, square_order: Optional[Sequence[int]]):
+    def order(self, square_order):
         previous = self._square_order
         self.set_order(square_order)
         try:
@@ -65,7 +65,7 @@ class TokenReorderer:
             self._square_order = previous
             self._cache.clear()
 
-    def token_permutation(self, grid_h: int, grid_w: int, device=None) -> torch.Tensor:
+    def token_permutation(self, grid_h, grid_w, device=None):
         """
         Token-level permutation for one image whose merged token grid is
         grid_h x grid_w (raster order, as produced by the vision merger):
@@ -91,7 +91,7 @@ class TokenReorderer:
         perm = self._cache[key]
         return perm.to(device) if device is not None else perm
 
-    def _llm_grid(self, thw) -> tuple:
+    def _llm_grid(self, thw):
         t, h, w = (int(x) for x in thw)
         if t != 1:
             raise ValueError("Token reordering supports still images only (t == 1).")
@@ -133,14 +133,14 @@ class TokenReorderer:
                 start += n
         return position_ids, deltas
 
-    def remove(self) -> None:
+    def remove(self):
         """Restores the original methods."""
         self.core.get_image_features = self._orig_image_features
         self.core.get_rope_index = self._orig_rope_index
         del self.core._token_reorderer
 
 
-def install_token_reordering(model, grid_size: int = 8) -> TokenReorderer:
+def install_token_reordering(model, grid_size=8) -> TokenReorderer:
     """Installs (once) and returns the TokenReorderer of `model`."""
     core = _find_core_model(model)
     existing = getattr(core, "_token_reorderer", None)
@@ -148,7 +148,7 @@ def install_token_reordering(model, grid_size: int = 8) -> TokenReorderer:
 
 
 @torch.no_grad()
-def verify_token_reordering(model, processor, image, square_order, prompt: str = "Describe the board.") -> dict:
+def verify_token_reordering(model, processor, image, square_order, prompt="Describe the board."):
     """
     Self-check to run once per environment (transformers versions differ):
     1. with no order set, outputs are identical to the unpatched model;

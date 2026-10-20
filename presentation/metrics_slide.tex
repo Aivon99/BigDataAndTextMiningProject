@@ -1,0 +1,119 @@
+% Evaluation-metrics slide: one 16:9 page (13.333in x 7.5in, same size as the deck).
+% Compile with pdfLaTeX on Overleaf, then screenshot the page and paste it as a full slide.
+\documentclass{article}
+\usepackage[paperwidth=13.333in,paperheight=7.5in,margin=0in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{caladea}                 % Cambria-compatible serif (deck headings)
+\usepackage[sfdefault,lf]{carlito}   % Calibri-compatible sans (deck body text)
+\usepackage{amsmath, amssymb}
+\usepackage{bbm}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage[absolute]{textpos}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\TPHorizModule}{1in}
+\setlength{\TPVertModule}{1in}
+
+% Deck palette
+\definecolor{ink}{HTML}{221C17}
+\definecolor{wood}{HTML}{B5652A}
+\definecolor{grey}{HTML}{6B625A}
+\definecolor{card}{HTML}{F6F1EB}
+\color{ink}
+
+\newcommand{\head}[1]{{\rmfamily\bfseries #1}}
+\newtcolorbox{metric}[2][]{enhanced, colback=card, frame hidden, arc=8pt,
+  left=14pt, right=14pt, top=10pt, bottom=10pt, boxsep=0pt,
+  fontupper=\large, #1,
+  title={\head{\LARGE #2}}, coltitle=ink, colbacktitle=card,
+  toptitle=10pt, bottomtitle=0pt, lefttitle=14pt, attach title to upper=\par\vspace{2pt}}
+\newcommand{\desc}[1]{{\color{grey}\normalsize #1}\par}
+
+\begin{document}
+
+% ---------- title ----------
+\begin{textblock}{12.1}(0.6,0.38)
+  {\rmfamily\bfseries\fontsize{34}{40}\selectfont Evaluation metrics}\par\vspace{6pt}
+  {\color{grey}\fontsize{16}{20}\selectfont
+  Let $N$ be the number of test examples, $B_i = (b_{i,1}, \dots, b_{i,64})$ the true board and
+  $\hat{B}_i$ the predicted one; let $y_i$ and $\hat{y}_i$ be the true and predicted FEN strings.}
+\end{textblock}
+
+% ---------- top row: EM, square accuracy, CER ----------
+\begin{textblock}{3.9}(0.6,1.9)
+\begin{metric}[height=2.35in]{Board exact match}
+  \desc{Share of boards predicted entirely correctly.}
+  \vfill
+  \[
+  \mathrm{EM} = \frac{1}{N} \sum_{i=1}^{N} \mathbbm{1}\!\left[\hat{B}_i = B_i\right]
+  \]
+  \vfill
+\end{metric}
+\end{textblock}
+
+\begin{textblock}{3.9}(4.715,1.9)
+\begin{metric}[height=2.35in]{Square-by-square accuracy}
+  \desc{Share of the 64 squares (piece or empty) predicted correctly.}
+  \vfill
+  \[
+  \mathrm{Acc}_{\mathrm{sq}} = \frac{1}{64\,N} \sum_{i=1}^{N} \sum_{s=1}^{64}
+  \mathbbm{1}\!\left[\hat{b}_{i,s} = b_{i,s}\right]
+  \]
+  \vfill
+\end{metric}
+\end{textblock}
+
+\begin{textblock}{3.9}(8.83,1.9)
+\begin{metric}[height=2.35in]{Character Error Rate (CER)}
+  \desc{Edit distance between FEN strings, normalised by the true length.}
+  \vspace{-4pt}
+  \[
+  \mathrm{CER} = \frac{1}{N} \sum_{i=1}^{N} \frac{\mathrm{Lev}(\hat{y}_i, y_i)}{|y_i|}
+  \]
+  \vspace{-6pt}
+  {\normalsize For one example, with $S$ substitutions, $D$ deletions and $I$ insertions:}
+  \vspace{-6pt}
+  \[
+  \mathrm{CER} = \frac{S + D + I}{|y|}
+  \]
+\end{metric}
+\end{textblock}
+
+% ---------- bottom row: Levenshtein ----------
+\begin{textblock}{12.13}(0.6,4.45)
+\begin{metric}[height=2.3in]{Levenshtein distance}
+  \desc{Minimum number of single-character edits that turn $\hat{y}$ into $y$. With $a = \hat{y}$ and $b = y$:}
+  \vfill
+  \begin{minipage}[c]{8.3in}
+  \[
+  \mathrm{Lev}_{a,b}(i,j) =
+  \begin{cases}
+  \max(i,j) & \text{if } \min(i,j) = 0, \\[6pt]
+  \min
+  \left\{
+  \begin{array}{l}
+  \mathrm{Lev}_{a,b}(i-1,j) + 1 \\
+  \mathrm{Lev}_{a,b}(i,j-1) + 1 \\
+  \mathrm{Lev}_{a,b}(i-1,j-1) + \mathbbm{1}\!\left[a_i \neq b_j\right]
+  \end{array}
+  \right.
+  & \text{otherwise}
+  \end{cases}
+  \]
+  \end{minipage}\hfill
+  \begin{minipage}[c]{3.2in}
+  The final value is\par\vspace{4pt}
+  $\mathrm{Lev}(a,b) = \mathrm{Lev}_{a,b}(|a|,|b|)$
+  \end{minipage}
+  \vfill
+\end{metric}
+\end{textblock}
+
+% ---------- footer (same as the other slides; add the slide number in PowerPoint if needed) ----------
+\begin{textblock}{8}(0.6,7.0)
+  {\color{grey}\fontsize{10}{12}\selectfont Chessboard Understanding with VLMs \& Patch Reordering}
+\end{textblock}
+
+\mbox{}
+\end{document}

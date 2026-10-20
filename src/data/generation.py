@@ -46,7 +46,7 @@ PROMPTS = {
 
 def render_board_svg(
     board: chess.Board,
-    size: int = 512,
+    size=512,
     lastmove: Optional[chess.Move] = None,
 ) -> Image.Image:
     """Draws the board as a PIL image. Coordinates are turned off so the 8x8
@@ -58,13 +58,13 @@ def render_board_svg(
 
 
 def build_sample(
-    fen: str,
-    task: str,
-    sample_id: str,
-    moves: Optional[str] = None,
-    puzzle_id: Optional[str] = None,
-    output_dir: Optional[Union[str, Path]] = None,
-    image_size: int = 512,
+    fen,
+    task,
+    sample_id,
+    moves=None,
+    puzzle_id=None,
+    output_dir=None,
+    image_size=512,
 ) -> Dict[str, Union[List[Image.Image], dict]]:
     """Builds one sample (images, prompt and target) for task1, task2 or task3."""
     if task not in PROMPTS:
@@ -130,7 +130,7 @@ def build_sample(
     return {"images": images, "metadata": metadata}
 
 
-def _render_sample_to_disk(args: tuple) -> dict:
+def _render_sample_to_disk(args):
     fen, task, sample_id, moves, puzzle_id, output_dir, image_size = args
     result = build_sample(
         fen=fen,
@@ -147,11 +147,11 @@ def _render_sample_to_disk(args: tuple) -> dict:
 RENDER_VERSION = "no-coordinates-v2"
 
 
-def _stamp_path(output_root: Path, task: str, split_name: str) -> Path:
+def _stamp_path(output_root, task, split_name):
     return output_root / ".render_stamps" / f"{task}_{split_name}"
 
 
-def _existing_sample_count(output_dir: Path) -> int:
+def _existing_sample_count(output_dir):
     metadata_path = output_dir / "metadata.jsonl"
     if not metadata_path.exists():
         return 0
@@ -161,11 +161,11 @@ def _existing_sample_count(output_dir: Path) -> int:
 
 def generate_datasets_parallel(
     task_splits: Dict[str, Dict[str, pd.DataFrame]],
-    output_root: Union[str, Path] = ".",
-    image_size: int = 512,
-    num_workers: Optional[int] = None,
-    skip_existing: bool = True,
-) -> None:
+    output_root=".",
+    image_size=512,
+    num_workers=None,
+    skip_existing=True,
+):
     """Generates all the task/split datasets in parallel and writes a
     metadata.jsonl file for each one.
 

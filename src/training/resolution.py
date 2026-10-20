@@ -3,7 +3,7 @@
 BOARD_SQUARES_PER_SIDE = 8
 
 
-def configure_image_resolution(processor, image_size: int, board_squares: int = BOARD_SQUARES_PER_SIDE) -> dict:
+def configure_image_resolution(processor, image_size, board_squares=BOARD_SQUARES_PER_SIDE):
     """Makes the processor resize every image to image_size x image_size, so the
     512px dataset can be used at 256px without rendering it again.
 

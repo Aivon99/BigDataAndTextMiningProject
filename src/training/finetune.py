@@ -19,14 +19,14 @@ from training.reordering import resolve_square_order
 from training.token_reordering import install_token_reordering
 
 
-def experiment_repo_id(task: str, strategy: str, tag: str | None = None, hf_org_prefix: str = "bdatm-project") -> str:
+def experiment_repo_id(task, strategy, tag=None, hf_org_prefix="bdatm-project"):
     """Hub repo of a LoRA run. The tag (e.g. "tok256") keeps the token-level runs
     apart from the legacy runs, which have no tag.
     """
     return f"{hf_org_prefix}/qwen-{task}-{strategy}{'-' + tag if tag else ''}-lora"
 
 
-def experiment_model_name(label: str, tag: str | None = None) -> str:
+def experiment_model_name(label, tag=None):
     """Name of a row in the results table, e.g. "Qwen + LoRA (Zigzag - SFT) [tok256]"."""
     return f"{label} [{tag}]" if tag else label
 
