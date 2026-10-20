@@ -52,10 +52,14 @@ From each puzzle we take the starting position and the first move.
 
 These numbers can be changed in `configs/config.yaml`.
 
-Lichess publishes only the latest version of the puzzle database and replaces it regularly, without
-keeping the older versions, so running `Datasets_creator.ipynb` today downloads a newer file and
-gives a different sample. The exact datasets we used are on Hugging Face (see the links above), so
-all the experiments can be reproduced from them.
+Lichess replaces its puzzle database regularly, so downloading it from Lichess today gives a newer
+file and a different sample. The version we used is kept as revision `5dc959d3f4` of
+[Lichess/chess-puzzles](https://huggingface.co/datasets/Lichess/chess-puzzles), Lichess's mirror on
+Hugging Face: with it, `Datasets_creator.ipynb` selects exactly our puzzles, with the same splits and
+order (a comment in its download cell shows how). We checked the puzzles and the splits, not the
+images: they are drawn again, and other versions of python-chess or cairosvg could change a few
+pixels. The exact datasets we used are on Hugging Face (see the links above), and all the
+experiments use them.
 
 ## Method
 
@@ -298,9 +302,9 @@ On Colab each notebook clones this repository by itself, from the branch set in
 the packages with `pip install -r requirements.txt`. On Colab, the diagnostics cell (Section 11)
 asks for access to Google Drive, where it saves its tables.
 
-Building the datasets again (`Datasets_creator.ipynb`) is not needed and gives different data,
-because Lichess replaces its puzzle database regularly (see [Dataset](#dataset)). To do it anyway,
-set `ORGANIZATION_NAME` in its upload cell to your own namespace, and change `dataset_name` in the
+Building the datasets again (`Datasets_creator.ipynb`) is not needed: the task notebooks use our
+datasets on Hugging Face. To use our exact version of the Lichess database, see [Dataset](#dataset).
+To build and upload the datasets anyway, set `ORGANIZATION_NAME` in its upload cell to your own namespace, and change `dataset_name` in the
 task notebooks to load your datasets.
 
 If a notebook is stopped, running it again picks up training from the last checkpoint saved on
