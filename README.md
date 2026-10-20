@@ -21,7 +21,7 @@ Datasets, trained models and results are stored in the
 | Results | [evaluation-results-task1](https://huggingface.co/datasets/bdatm-project/evaluation-results-task1), [evaluation-results-task2](https://huggingface.co/datasets/bdatm-project/evaluation-results-task2), [evaluation-results-task3](https://huggingface.co/datasets/bdatm-project/evaluation-results-task3) |
 
 The strategy in the model name is `raster`, `zigzag`, `spiral_center_out`, `file_wise`,
-`hilbert` or `learned`.
+`hilbert`, `learned` or `learned-frozen`.
 
 The repositories without `-tok256` (`qwen-task{1,2,3}-{standard,zigzag,spiral,file_wise,learned-reordering}-lora`)
 come from our first implementation, which reordered pixel tiles of 512px images (see
@@ -155,14 +155,15 @@ Main findings:
   tokens in any other order (0% on Task 1).
 - When a model is trained with an order, no fixed order wins on every task (spiral_center_out on
   Task 1, raster on Task 2, file_wise on Task 3).
-- The learned order stays close to raster and does not beat it.
+- The learned order stays close to raster and does not beat it. Training on with the frozen
+  policy helps on every task (on Task 3 from 57.25 to 75.00), but it still stays below raster.
 - 512px is better than the 1:1 grid, especially on Task 3: more tokens per square help more than
   the exact alignment.
 - On Task 2, most errors of the raster model are notation only. In 119 of its 121 "same move,
   different notation" errors, the only difference is `x`, `+` or `#`. A single image taken after
   the move cannot show whether a piece was captured, and 147 of the 400 test moves are captures.
 - On Task 3 (raster model, 100 test samples), swapping the two frames or giving the same frame
-  twice raises the answer loss from 0.16 to 1.4-2.2 (about 9-13 times), and the correct order has
+  twice raises the answer loss from 0.16 to 1.4-2.2 (about 9-14 times), and the correct order has
   the lowest loss on 94% of the samples. So the model really compares the two images.
 
 The full tables (with all metrics) are on Hugging Face:
@@ -322,4 +323,4 @@ our published results are checked by evaluating the published models again (see
 ## Authors
 
 - Tommaso Bergonzoni
-- Ivo Rimbaldi
+- Ivo Rambaldi
