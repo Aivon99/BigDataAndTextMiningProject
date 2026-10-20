@@ -3,7 +3,7 @@
 Project for the **Big Data Analytics and Text Mining** course at the **University of Bologna**.
 
 - Professor: Gianluca Moro, University of Bologna
-- Tutor: Ing. Giacomo Frisoni
+- Tutor: Ing. Giacomo Frisoni, Ing. Lorenzo Molfetta
 
 We fine-tune a small vision-language model (Qwen3.5-0.8B) with LoRA to read chessboard images,
 and we study how the order in which the model reads the image tokens changes the results,
