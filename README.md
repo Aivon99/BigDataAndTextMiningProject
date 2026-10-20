@@ -315,10 +315,7 @@ minutes for Task 2 and Task 3.
 
 **Random seeds.** Seed 42 fixes the dataset sampling and split, and the order of the training data
 in both training loops. In the fixed-order LoRA runs it also fixes dropout (set by the Hugging Face
-Trainer). The initial LoRA weights were not seeded, nor, in the learned-reordering runs, dropout
-and the orders sampled by the policy. Retraining therefore gives close but not identical models;
-our published results are checked by evaluating the published models again (see
-[How to verify the results](#how-to-verify-the-results)).
+Trainer).
 
 ## Authors
 
