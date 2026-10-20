@@ -7,3 +7,10 @@ dataset_task2/
 dataset_task3/
 .render_stamps/
 __pycache__/
+
+# Folders created by the notebooks while they run
+temp_*_output/
+learned_reordering_output/
+my_dataset_files/
+task3_files/
+diagnostics/

@@ -19,6 +19,7 @@ REORDER_DIR = Path(__file__).resolve().parents[2] / "external" / "REOrder"
 
 
 def ensure_reorder_checkout(reorder_dir=REORDER_DIR):
+    """Clones REOrder at the pinned commit into external/REOrder, unless it is already there."""
     marker = reorder_dir / "src" / "models" / "layers" / "plackett_luce.py"
     if marker.exists():
         return reorder_dir

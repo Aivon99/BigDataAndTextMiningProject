@@ -5,6 +5,7 @@ import pandas as pd
 
 
 def load_config(config_path="configs/config.yaml"):
+    """Reads the YAML config file into a dict."""
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 

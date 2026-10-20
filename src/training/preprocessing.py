@@ -80,6 +80,8 @@ def preprocess_function(sample, processor):
     if "image_grid_thw" in batch:
         result["image_grid_thw"] = batch["image_grid_thw"]
 
+    # The loss is computed only on the answer: the prompt is tokenized again on its own to find
+    # where the answer starts, and every token before it gets the label -100 (ignored).
     assistant_marker = "<|im_start|>assistant\n"
     marker_pos = text.index(assistant_marker)
     prompt_only_text = text[: marker_pos + len(assistant_marker)]
@@ -101,6 +103,8 @@ def preprocess_function(sample, processor):
 
 
 class Qwen35VisionDataCollator:
+    """Pads the text tensors of a batch and concatenates the image tensors."""
+
     def __init__(self, processor):
         self.processor = processor
         self.pad_token_id = processor.tokenizer.pad_token_id

@@ -31,6 +31,8 @@ def _find_core_model(model):
 
 
 class TokenReorderer:
+    """Patches a Qwen3.5 model so the visual tokens are read in a given square order."""
+
     def __init__(self, model, grid_size=8):
         self.core = _find_core_model(model)
         self.grid_size = grid_size
@@ -57,6 +59,7 @@ class TokenReorderer:
 
     @contextmanager
     def order(self, square_order):
+        """Context manager: uses square_order inside the `with` block, then restores the previous order."""
         previous = self._square_order
         self.set_order(square_order)
         try:

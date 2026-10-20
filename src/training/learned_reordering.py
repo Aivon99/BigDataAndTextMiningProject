@@ -198,6 +198,8 @@ def train_with_learned_reordering(
             sample = preprocess_function(_raw_sample(rows[i], task), processor)
             inputs, labels = _to_model_inputs(sample, device)
 
+            # Sample the orders for this sample (raster during the warm-up epochs); the Gumbel
+            # temperature goes linearly from gumbel_temp_start to gumbel_temp_end.
             if policy_active:
                 policy_step = state["opt_step"] - steps_per_epoch * policy_start_after_epochs
                 frac = min(1.0, max(0, policy_step) / policy_steps_total)
@@ -206,12 +208,14 @@ def train_with_learned_reordering(
             else:
                 orders, log_probs = [None], None
 
+            # LoRA update: language-model loss with the first sampled order
             with reorderer.order(None if orders[0] is None else orders[0].tolist()):
                 lm_loss = lora_model(**inputs, labels=labels).loss
             (lm_loss / grad_accum_steps).backward()
             running["lm"] += lm_loss.item()
             running["n"] += 1
 
+            # Policy update (REINFORCE): the reward of each order is minus its loss on this sample
             if policy_active:
                 losses = [lm_loss.detach()]
                 with torch.no_grad():
@@ -230,6 +234,7 @@ def train_with_learned_reordering(
                 (policy_loss / grad_accum_steps).backward()
                 running["adv"] += advantage.abs().mean().item()
 
+            # Optimizer step every grad_accum_steps samples, with periodic checkpoints on the Hub
             if (i + 1) % grad_accum_steps == 0 or i + 1 == n_rows:
                 torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
                 model_optimizer.step()

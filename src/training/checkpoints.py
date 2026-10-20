@@ -76,6 +76,8 @@ def find_resumable_checkpoint(repo_id):
     )
     candidate = Path(local_dir) / "last-checkpoint"
     if candidate.exists() and any(candidate.iterdir()):
+        # Older checkpoints were trained in fp16 and saved a gradient scaler; training now uses
+        # bf16, which has none, and the Trainer fails when it finds one while resuming.
         (candidate / "scaler.pt").unlink(missing_ok=True)
         print(f"Found a resumable checkpoint on the Hub for '{repo_id}': {candidate}")
         return str(candidate)
@@ -112,6 +114,7 @@ class HubBestAdapterCallback(TrainerCallback):
         self.repo_id = repo_id
 
     def on_save(self, args, state, control, **kwargs):
+        """Uploads the adapter to best-checkpoint/ when the epoch just saved is the best so far."""
         best = state.best_model_checkpoint
         if not best or Path(best).name != f"checkpoint-{state.global_step}" or not Path(best).is_dir():
             return
@@ -132,6 +135,7 @@ class HubBestAdapterCallback(TrainerCallback):
         )
 
     def on_train_end(self, args, state, control, model=None, **kwargs):
+        """Loads the best adapter from the Hub if the local best checkpoint is gone (new session)."""
         if not args.load_best_model_at_end or state.best_metric is None or model is None:
             return
         local_best = state.best_model_checkpoint
