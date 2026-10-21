@@ -14,3 +14,7 @@ learned_reordering_output/
 my_dataset_files/
 task3_files/
 diagnostics/
+
+# Created by Reproduce_results.ipynb
+.venv_task1/
+reproduce_task*.json
