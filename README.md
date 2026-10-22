@@ -243,14 +243,9 @@ reproduced score on the same samples and how many predictions are identical. Dec
 on the same GPU type the predictions should be identical or differ on one or two samples; on a
 different GPU type a few more can change.
 
-**Two torch versions.** Greedy predictions also depend on the torch version, and our results were
-produced with two: Task 1 with torch 2.14.1 (`Task_1.ipynb` upgrades torch), Tasks 2 and 3 with
-torch 2.11.0 (preinstalled on Colab). One Python process can load only one torch version, so the
-notebook evaluates Tasks 2 and 3 in the notebook itself with torch 2.11.0, and Task 1 in a separate
-Python process (`python -m eval.reproduce`, code in `src/eval/reproduce.py`) that runs in a small
-virtualenv (`.venv_task1/`) with torch 2.14.1 and shares every other package with the notebook.
-It all runs with *Run all*, without restarting the runtime, and the output of Task 1 appears in
-its cell while it runs. Installing torch 2.14.1 takes a few extra minutes.
+**torch version.** Greedy predictions also depend on the torch version. All our results were
+produced with torch 2.11.0, the CUDA 13.0 build preinstalled on Colab during our runs; the notebook
+keeps Colab's torch if it is that version and installs it otherwise.
 
 To run it locally instead, install the packages with `pip install -r requirements.txt`, set
 `CONFIG["colab"] = False` in the notebook and start Jupyter from the `notebooks/` folder.
@@ -270,7 +265,7 @@ others. To train a 512px model with the current code, set `IMAGE_SIZE = 512` in 
 Our runs used Google Colab with an NVIDIA L4 GPU. The task notebooks install the newest release
 of each package, so the versions below are the releases that were current during our final runs
 (October 2026). They are pinned in `requirements.txt`, and `Reproduce_results.ipynb` installs
-exactly these versions, with the torch version of each task.
+exactly these versions.
 
 | Package | Version |
 |---|---|
@@ -280,7 +275,7 @@ exactly these versions, with the torch version of each task.
 | datasets | 5.1.0 |
 | huggingface_hub | 2.2.0 |
 | flash-linear-attention | 0.5.2 |
-| torch | 2.14.1 for Task 1 (the notebook upgrades it); 2.11.0, Colab's preinstalled version, for Tasks 2 and 3 |
+| torch | 2.11.0 (Colab's preinstalled version, CUDA 13.0 build) |
 
 Qwen3.5 needs transformers 5.2.0 or newer. The token reordering patches internal methods of the
 model in transformers, so other versions may break it; `verify_token_reordering` checks that it

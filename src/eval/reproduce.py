@@ -3,9 +3,8 @@ predictions. Used by notebooks/Reproduce_results.ipynb.
 
 Each task must run with the torch version that produced its saved results
 (TORCH_VERSIONS): with another version the bfloat16 kernels change the logits
-slightly, and greedy decoding can then pick a different token. Since one Python
-process can load only one torch version, the notebook runs Task 1 in a separate
-Python environment through the command line of this module:
+slightly, and greedy decoding can then pick a different token. A task can also be
+run from the command line:
 
     python -m eval.reproduce --task task1 --level main --output task1.json
 """
@@ -48,9 +47,9 @@ STRATEGIES = ["zigzag", "spiral_center_out", "file_wise", "hilbert"]
 N_SHOT = 3                  # solved train examples in the prompt of the 3-shot vanilla model
 LEVELS = ("main", "tables", "full")
 
-# torch version that produced the saved results of each task: Task_1.ipynb upgrades
-# torch, Task_2.ipynb and Task_3.ipynb use the one preinstalled on Colab
-TORCH_VERSIONS = {"task1": "2.14.1", "task2": "2.11.0", "task3": "2.11.0"}
+# torch version that produced the saved results of each task: the one preinstalled on
+# Colab during our runs (Task 1 was evaluated again with it)
+TORCH_VERSIONS = {"task1": "2.11.0", "task2": "2.11.0", "task3": "2.11.0"}
 
 # Main score of each task, as in the README: Task 1 compares the board part of the FEN,
 # Tasks 2 and 3 the SAN move taken from the first line of the answer
