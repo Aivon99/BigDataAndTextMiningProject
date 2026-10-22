@@ -2,9 +2,8 @@
 # releases that were current during our final runs (Google Colab, October 2026).
 # Qwen3.5 needs transformers 5.2.0 or newer.
 #
-# torch: our Task 2 and Task 3 results were produced with torch 2.11.0 (Colab's preinstalled
-# version), our Task 1 results with torch 2.14.1. Reproduce_results.ipynb uses 2.11.0 in the
-# notebook and installs 2.14.1 in a separate environment (.venv_task1/) for Task 1.
+# torch: all our results were produced with torch 2.11.0 (Colab's preinstalled version, CUDA 13.0
+# build). Reproduce_results.ipynb installs it if Colab has a different version.
 
 torch==2.11.0
 torchvision==0.26.0

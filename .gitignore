@@ -16,5 +16,4 @@ task3_files/
 diagnostics/
 
 # Created by Reproduce_results.ipynb
-.venv_task1/
 reproduce_task*.json
