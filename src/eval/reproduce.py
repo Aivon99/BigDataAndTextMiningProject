@@ -15,6 +15,8 @@ import io
 import json
 import os
 
+import datasets
+import huggingface_hub
 import pandas as pd
 import torch
 import transformers
@@ -36,6 +38,13 @@ from training.finetune import experiment_model_name, experiment_repo_id
 from training.reordering import resolve_square_order
 from training.resolution import configure_image_resolution
 from training.token_reordering import install_token_reordering, verify_token_reordering
+
+# Every dataset is stored on the Hub as thousands of image files, and each download would print its
+# own progress bars (about 8,000 lines for one dataset). Turn off the progress bars of the downloads,
+# dataset loading and weight loading; the evaluation loop keeps its own progress bar.
+huggingface_hub.utils.disable_progress_bars()
+datasets.utils.disable_progress_bars()
+transformers.utils.logging.disable_progress_bar()
 
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"

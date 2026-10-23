@@ -200,6 +200,7 @@ src/
     evaluation.py          runs a model on the test set of each task
     results.py             saves and loads the results on Hugging Face
     diagnostics.py         extra analysis of the errors and of the training runs
+    reproduce.py           evaluation code of Reproduce_results.ipynb
   training/
     checkpoints.py         saves and resumes training runs on Hugging Face
     preprocessing.py       turns dataset rows into model inputs
@@ -222,7 +223,12 @@ with the ones we saved, sample by sample.
 1. Open the notebook in Google Colab (*File > Open notebook > GitHub*, or upload it) and choose an
    **L4** or **A100** GPU (*Runtime > Change runtime type*). The model runs in bfloat16, which the
    free T4 GPU does not support well.
-2. Choose `LEVEL` in Section 2 of the notebook (on Colab it is a drop-down menu). The outputs
+2. **Recommended:** add a Hugging Face token as a Colab secret. Create a read-only token at
+   [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) (any free account
+   works), then in Colab open *Secrets* (key icon in the left sidebar), add a secret called
+   `HF_TOKEN` with the token as its value and allow the notebook to access it. Without a token the
+   notebook still runs, but Hugging Face can stop the downloads with a rate-limit error (see below).
+3. Choose `LEVEL` in Section 2 of the notebook (on Colab it is a drop-down menu). The outputs
    saved in the notebook come from `"tables"`; for a quick check choose `"main"`:
 
    | `LEVEL` | What runs | Time on an L4 |
@@ -231,17 +237,39 @@ with the ones we saved, sample by sample.
    | `"tables"` (the saved outputs) | Every row of the tables above, including the 512px resolution ablation. Task 2 and Task 3 on all 400 samples; Task 1 on all 400 samples for the raster LoRA model and on the first 100 for the other rows | about 2.5 h |
    | `"full"` | Every row of the tables above, including the 512px resolution ablation, on all 400 test samples | about 6.5 h |
 
-3. Run all the cells (*Runtime > Run all*).
+4. Run all the cells (*Runtime > Run all*).
 
 The times above are for the evaluation. Without a token, downloading the three datasets from
 Hugging Face takes some extra time: about 10 minutes each for Task 1 and Task 2 and about 20
 minutes for Task 3 (two images per sample), measured on our connection.
 
-No Hugging Face token is needed: all our datasets, models and result tables are public, and the
-notebook does not write anything to the Hub. The last cell shows, for each model, our score, the
-reproduced score on the same samples and how many predictions are identical. Decoding is greedy, so
-on the same GPU type the predictions should be identical or differ on one or two samples; on a
-different GPU type a few more can change.
+**Why a token helps.** All our datasets, models and result tables are public and the notebook does
+not write anything to the Hub, so the token does not need any access to our repositories. But each
+dataset is stored as thousands of image files, one download each, and Hugging Face allows far fewer
+downloads without a token than with one. `huggingface_hub` reads the `HF_TOKEN` secret by itself,
+so the token never appears in the notebook; the setup cell prints whether one was found. Locally,
+set the `HF_TOKEN` environment variable or run `hf auth login`.
+
+The last cell shows, for each model, our score, the
+reproduced score on the same samples and how many predictions are identical.
+
+**The predictions are not exactly the same as ours.** Decoding is greedy (no sampling), but GPU
+computations in bfloat16 have some numerical noise: the order of the operations inside the GPU
+kernels can change from one run to another, and this changes the logits very slightly. When two
+tokens are almost equally likely, this is enough to pick the other one, and the rest of the answer
+then follows from it. This happens where the model is unsure:
+
+- In Task 1, the parts of the FEN that cannot be seen in the image (side to move and the move
+  counters) are guesses, so they can easily change, and then the whole predicted string is
+  different. The board, which the score is based on, is read with confidence and changes very
+  rarely.
+- The vanilla models are unsure about almost every token and write long answers, so many of their
+  predictions change, but their score stays close to 0.
+- The LoRA models of Task 2 and Task 3 answer with a few tokens and are confident, so almost all
+  their predictions are identical.
+
+The scores should match ours or differ by one or two samples (at most about half a point on 400
+samples). On a different GPU type a few more predictions can change.
 
 **torch version.** Greedy predictions also depend on the torch version. All our results were
 produced with torch 2.11.0, the CUDA 13.0 build preinstalled on Colab during our runs; the notebook
