@@ -262,10 +262,11 @@ others. To train a 512px model with the current code, set `IMAGE_SIZE = 512` in 
 
 ## Tested environment
 
-Our runs used Google Colab with an NVIDIA L4 GPU. The task notebooks install the newest release
-of each package, so the versions below are the releases that were current during our final runs
-(October 2026). They are pinned in `requirements.txt`, and `Reproduce_results.ipynb` installs
-exactly these versions.
+Our runs used Google Colab with an NVIDIA L4 GPU and the package versions below, the releases that
+were current during our final runs (October 2026). They are pinned in `requirements.txt`, and
+`Reproduce_results.ipynb` installs exactly these versions. `Task_1.ipynb` installs them too, while
+`Task_2.ipynb` and `Task_3.ipynb` install the newest release of each package (these were the
+newest releases when we ran them). All the task notebooks keep Colab's preinstalled torch.
 
 | Package | Version |
 |---|---|
